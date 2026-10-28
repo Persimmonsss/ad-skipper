@@ -255,9 +255,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
             if (currentTime - lastAdDetectedTime > RESET_TIMEOUT_MS) consecutiveSwipes = 0
             else return
         }
-        val rootNode = rootInActiveWindow ?: return
-        // 事件可能来自刚切走的 App，而活动窗口已是新 App
-        if (activeWindowPackage() != pkg) return
+        val rootNode = activeWindowRoot() ?: return
+        // 事件可能来自刚切走的 App，活动窗口必须仍是事件来源
         if (rootNode.packageName?.toString() != pkg) return
         try {
             processScreen(rootNode, currentTime, fromEvent = true)
@@ -278,7 +277,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
         if (!TARGET_PACKAGES.contains(foregroundPkg)) return
         // 启动切换瞬间 rootInActiveWindow 可能仍是上一个 App，以活动窗口为准
         if (!TARGET_PACKAGES.contains(activeWindowPackage())) return
-        val rootNode = rootInActiveWindow
+        val rootNode = activeWindowRoot()
         if (rootNode == null) {
             // 每20次打印一次"等待窗口"日志，避免刷屏
             if (screenCheckCount % 20 == 0) {
@@ -315,6 +314,16 @@ class AdSkipAccessibilityService : AccessibilityService() {
             null
         }
         return fromWindows ?: rootInActiveWindow?.packageName?.toString().orEmpty()
+    }
+
+    /** 读界面文本时优先用活动窗口，避免读到下层残留页面的内容。 */
+    private fun activeWindowRoot(): AccessibilityNodeInfo? {
+        val root = try {
+            windows.firstOrNull { it.isActive }?.root
+        } catch (e: Exception) {
+            null
+        }
+        return root ?: rootInActiveWindow
     }
 
     // ==================== 核心处理：采集 + 检测广告 ====================
@@ -376,7 +385,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
      * 检查滑动结果
      */
     private fun checkSwipeResult() {
-        val rootNode = rootInActiveWindow ?: return
+        val rootNode = activeWindowRoot() ?: return
         val packageName = rootNode.packageName?.toString() ?: return
         if (!TARGET_PACKAGES.contains(packageName)) return
 
@@ -461,12 +470,14 @@ class AdSkipAccessibilityService : AccessibilityService() {
         }
 
         // 策略2：倒计时
+        // 选集面板等信息流页面会有一堆纯数字节点，不能当倒计时
+        val bareDigits = allTexts.count { Regex("""^\d{1,2}$""").matches(it.trim()) }
         for (text in allTexts) {
             val trimmed = text.trim()
-            if (matchesAdCountdown(trimmed)) {
-                lastAdKeyword = "倒计时:\"$trimmed\""
-                return true
-            }
+            if (!matchesAdCountdown(trimmed)) continue
+            if (bareDigits >= 3 && Regex("""^\d{1,2}$""").matches(trimmed)) continue
+            lastAdKeyword = "倒计时:\"$trimmed\""
+            return true
         }
 
         // 策略3：广告SDK控件
