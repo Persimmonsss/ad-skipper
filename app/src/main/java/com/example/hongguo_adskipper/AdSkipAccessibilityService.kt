@@ -100,6 +100,13 @@ class AdSkipAccessibilityService : AccessibilityService() {
         private val handler = Handler(Looper.getMainLooper())
     }
 
+    private val biliBubble by lazy { SkipBubble(this) }
+    private val biliUi by lazy { BiliUiSkip(this, biliBubble) }
+
+    // 前台包名：红果不在前台时不做轮询（省电）
+    private var foregroundPkg = ""
+    private var foregroundAt = 0L
+
     private val periodicCheck = object : Runnable {
         override fun run() {
             try {
@@ -108,6 +115,17 @@ class AdSkipAccessibilityService : AccessibilityService() {
                 logDebug("定时检测异常: ${e.message}")
             }
             handler.postDelayed(this, CHECK_INTERVAL_MS)
+        }
+    }
+
+    private val biliTicker = object : Runnable {
+        override fun run() {
+            try {
+                if (foregroundPkg == BiliUiSkip.BILI_PKG) biliUi.tick()
+            } catch (e: Exception) {
+                Log.w(TAG, "B站定时检查异常: ${e.message}")
+            }
+            handler.postDelayed(this, 1000L)
         }
     }
 
@@ -121,7 +139,10 @@ class AdSkipAccessibilityService : AccessibilityService() {
         isServiceEnabled = true
         createNotificationChannel()
         showNotification()
+        handler.removeCallbacks(periodicCheck)
+        handler.removeCallbacks(biliTicker)
         handler.postDelayed(periodicCheck, CHECK_INTERVAL_MS)
+        handler.postDelayed(biliTicker, 1000L)
         logDebug("服务已启动 $VERSION")
     }
 
@@ -197,6 +218,11 @@ class AdSkipAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
+        val pkg = event.packageName?.toString()
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && pkg != null) {
+            foregroundPkg = pkg
+            foregroundAt = SystemClock.elapsedRealtime()
+        }
         if (Settings.splashEnabled) {
             try {
                 handleSplashEvent(event)
@@ -204,8 +230,19 @@ class AdSkipAccessibilityService : AccessibilityService() {
                 Log.w(TAG, "开屏检测异常: ${e.message}")
             }
         }
+        if (pkg == BiliUiSkip.BILI_PKG) {
+            if (Settings.biliEnabled) {
+                try {
+                    biliUi.onEvent { rootInActiveWindow }
+                } catch (e: Exception) {
+                    Log.w(TAG, "B站跳转异常: ${e.message}")
+                }
+            }
+            return
+        }
         if (!Settings.hongguoEnabled) return
-        if (!TARGET_PACKAGES.contains(event.packageName?.toString())) return
+        if (!TARGET_PACKAGES.contains(pkg)) return
+        if (pkg != null) foregroundPkg = pkg
         val currentTime = System.currentTimeMillis()
         if (currentTime - lastSwipeTime < SWIPE_DELAY_MS) return
         if (consecutiveSwipes >= MAX_CONSECUTIVE_SWIPES) {
@@ -222,7 +259,14 @@ class AdSkipAccessibilityService : AccessibilityService() {
     // ==================== 定时轮询 ====================
 
     private fun performPeriodicCheck() {
+        // 兜底刷新前台包名（事件丢失时靠它恢复）
+        if (SystemClock.elapsedRealtime() - foregroundAt > 30_000) {
+            foregroundPkg = rootInActiveWindow?.packageName?.toString().orEmpty()
+            foregroundAt = SystemClock.elapsedRealtime()
+        }
         if (!Settings.hongguoEnabled) return
+        // 按需唤醒：只有红果在前台才扫描界面
+        if (!TARGET_PACKAGES.contains(foregroundPkg)) return
         val rootNode = rootInActiveWindow
         if (rootNode == null) {
             // 每20次打印一次"等待窗口"日志，避免刷屏
@@ -233,10 +277,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
         }
         val packageName = rootNode.packageName?.toString() ?: ""
         if (!TARGET_PACKAGES.contains(packageName)) {
-            // 记录当前前台App包名，方便排查
-            if (screenCheckCount % 20 == 0 && packageName.isNotEmpty()) {
-                logDebug("前台App: $packageName (非红果)")
-            }
+            foregroundPkg = packageName
             return
         }
         val currentTime = System.currentTimeMillis()
@@ -607,6 +648,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
         super.onDestroy()
         isServiceEnabled = false
         handler.removeCallbacks(periodicCheck)
+        handler.removeCallbacks(biliTicker)
         Log.d(TAG, "服务已销毁")
     }
 }

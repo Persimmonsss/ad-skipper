@@ -14,6 +14,8 @@ object Stats {
     @Volatile var biliTitle: String = "-"
     @Volatile var biliBvid: String? = null
     @Volatile var biliSegments: Int = 0
+    @Volatile var biliSegList: List<AdSegment> = emptyList()
+    @Volatile var biliUiActiveAt: Long = 0
     @Volatile var biliPositionMs: Long = 0
     @Volatile var biliDurationMs: Long = 0
     @Volatile var biliSkipCount: Int = 0
