@@ -1,18 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Android 13+ 通知权限 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <application
+        android:name=".App"
         android:allowBackup="true"
         android:icon="@android:drawable/sym_def_app_icon"
-        android:label="红果广告跳过器"
+        android:label="@string/app_name"
         android:roundIcon="@android:drawable/sym_def_app_icon"
         android:supportsRtl="true"
         android:theme="@style/Theme.HongGuoAdSkipper">
 
-        <!-- 主界面 -->
         <activity
             android:name=".MainActivity"
             android:exported="true">
@@ -22,10 +24,11 @@
             </intent-filter>
         </activity>
 
-        <!-- 无障碍服务 -->
+        <!-- 无障碍：红果剧内广告 + 开屏广告 -->
         <service
             android:name=".AdSkipAccessibilityService"
             android:exported="false"
+            android:label="@string/a11y_service_label"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
             <intent-filter>
                 <action android:name="android.accessibilityservice.AccessibilityService" />
@@ -33,6 +36,17 @@
             <meta-data
                 android:name="android.accessibilityservice"
                 android:resource="@xml/accessibility_service_config" />
+        </service>
+
+        <!-- 通知使用权：B站播放进度与媒体控制 -->
+        <service
+            android:name=".BiliPlaybackWatcher"
+            android:exported="true"
+            android:label="@string/nls_service_label"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
         </service>
 
     </application>

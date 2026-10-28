@@ -1,116 +1,325 @@
 <?xml version="1.0" encoding="utf-8"?>
 <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
-    android:layout_height="match_parent">
+    android:layout_height="match_parent"
+    android:background="#FAFAFC"
+    android:fillViewport="true">
 
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="vertical"
-        android:padding="20dp">
+        android:padding="18dp">
 
-        <!-- 标题 -->
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="红果广告跳过器"
-            android:textSize="24sp"
+            android:text="@string/app_name"
+            android:textColor="#15151A"
+            android:textSize="26sp"
             android:textStyle="bold" />
 
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginBottom="4dp"
-            android:text="自动检测广告，滑动跳过"
-            android:textSize="13sp"
-            android:textColor="#888888" />
+            android:layout_marginTop="2dp"
+            android:text="免 root · 按需唤醒 · B站 / 开屏 / 红果"
+            android:textColor="#8A8A94"
+            android:textSize="12sp" />
 
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginBottom="16dp"
-            android:text="v1.3.0"
-            android:textSize="11sp"
-            android:textColor="#BBBBBB" />
-
-        <!-- 状态栏 -->
+        <!-- 权限 -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:background="#F0F0F0"
+            android:layout_marginTop="16dp"
+            android:background="@drawable/card_bg"
             android:orientation="vertical"
-            android:padding="16dp"
-            android:layout_marginBottom="12dp">
+            android:padding="14dp">
 
             <TextView
-                android:id="@+id/tv_status"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="检测中..."
-                android:textSize="18sp"
+                android:text="权限"
+                android:textColor="#15151A"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:id="@+id/tv_a11y_status"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="无障碍服务：检查中"
+                    android:textColor="#45454E"
+                    android:textSize="13sp" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btn_a11y"
+                    style="@style/Widget.Material3.Button.TonalButton"
+                    android:layout_width="wrap_content"
+                    android:layout_height="40dp"
+                    android:minWidth="0dp"
+                    android:text="去开启"
+                    android:textSize="12sp" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:id="@+id/tv_nls_status"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="通知使用权：检查中"
+                    android:textColor="#45454E"
+                    android:textSize="13sp" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btn_nls"
+                    style="@style/Widget.Material3.Button.TonalButton"
+                    android:layout_width="wrap_content"
+                    android:layout_height="40dp"
+                    android:minWidth="0dp"
+                    android:text="去开启"
+                    android:textSize="12sp" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:id="@+id/tv_overlay_status"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="悬浮窗：检查中"
+                    android:textColor="#45454E"
+                    android:textSize="13sp" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btn_overlay"
+                    style="@style/Widget.Material3.Button.TonalButton"
+                    android:layout_width="wrap_content"
+                    android:layout_height="40dp"
+                    android:minWidth="0dp"
+                    android:text="去开启"
+                    android:textSize="12sp" />
+            </LinearLayout>
+        </LinearLayout>
+
+        <!-- 功能开关 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:background="@drawable/card_bg"
+            android:orientation="vertical"
+            android:padding="14dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="功能"
+                android:textColor="#15151A"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/sw_bili"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="B站内嵌广告"
+                android:textColor="#22222A"
+                android:textSize="14sp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="社区库标注的恰饭片段，进段前 3 秒自动跳过"
+                android:textColor="#9A9AA2"
+                android:textSize="11sp" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/sw_bubble"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:text="跳过气泡提示"
+                android:textColor="#22222A"
+                android:textSize="14sp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="关掉后静默跳，不弹任何提示"
+                android:textColor="#9A9AA2"
+                android:textSize="11sp" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/sw_splash"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:text="开屏广告"
+                android:textColor="#22222A"
+                android:textSize="14sp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="应用启动 10 秒内自动点掉 跳过 / 关闭"
+                android:textColor="#9A9AA2"
+                android:textSize="11sp" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/sw_hongguo"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:text="红果剧内广告"
+                android:textColor="#22222A"
+                android:textSize="14sp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="红果短剧检测到广告页时自动上滑"
+                android:textColor="#9A9AA2"
+                android:textSize="11sp" />
+        </LinearLayout>
+
+        <!-- 运行状态 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:background="@drawable/card_bg"
+            android:orientation="vertical"
+            android:padding="14dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="运行状态"
+                android:textColor="#15151A"
+                android:textSize="15sp"
                 android:textStyle="bold" />
 
             <TextView
-                android:id="@+id/tv_hint"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="4dp"
-                android:text="请先开启无障碍服务权限"
-                android:textSize="12sp"
-                android:textColor="#666666" />
-        </LinearLayout>
-
-        <!-- 操作按钮 -->
-        <Button
-            android:id="@+id/btn_go_settings"
-            android:layout_width="match_parent"
-            android:layout_height="48dp"
-            android:layout_marginBottom="8dp"
-            android:text="去开启无障碍服务" />
-
-        <Button
-            android:id="@+id/btn_open_hongguo"
-            android:layout_width="match_parent"
-            android:layout_height="48dp"
-            android:layout_marginBottom="8dp"
-            android:text="打开红果短剧" />
-
-        <Button
-            android:id="@+id/btn_refresh"
-            android:layout_width="match_parent"
-            android:layout_height="48dp"
-            android:layout_marginBottom="12dp"
-            android:text="刷新数据" />
-
-        <!-- 屏幕文字预览 -->
-        <TextView
-            android:id="@+id/tv_screen_texts"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginBottom="8dp"
-            android:textSize="12sp"
-            android:textColor="#4CAF50"
-            android:visibility="gone" />
-
-        <!-- 监控数据面板 -->
-        <ScrollView
-            android:id="@+id/stats_panel"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:background="#FFF8E1"
-            android:visibility="gone">
-
-            <TextView
-                android:id="@+id/tv_stats_content"
+                android:id="@+id/tv_bili_state"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:lineSpacingExtra="2dp"
+                android:text="B站：未在播放"
+                android:textColor="#45454E"
+                android:textSize="12sp" />
+
+            <TextView
+                android:id="@+id/tv_stats"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:lineSpacingExtra="2dp"
+                android:text="累计跳过：0"
+                android:textColor="#45454E"
+                android:textSize="12sp" />
+        </LinearLayout>
+
+        <!-- 日志 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:background="@drawable/card_bg"
+            android:orientation="vertical"
+            android:padding="14dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="日志"
+                    android:textColor="#15151A"
+                    android:textSize="15sp"
+                    android:textStyle="bold" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btn_clear_log"
+                    style="@style/Widget.Material3.Button.TextButton"
+                    android:layout_width="wrap_content"
+                    android:layout_height="36dp"
+                    android:minWidth="0dp"
+                    android:text="清空"
+                    android:textSize="12sp" />
+            </LinearLayout>
+
+            <TextView
+                android:id="@+id/tv_log"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
                 android:fontFamily="monospace"
                 android:lineSpacingExtra="2dp"
-                android:padding="12dp"
-                android:text="等待数据..."
-                android:textColor="#333333"
-                android:textSize="12sp" />
-        </ScrollView>
+                android:text="等待事件…"
+                android:textColor="#5A5A64"
+                android:textSize="11sp" />
+        </LinearLayout>
 
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="14dp"
+            android:orientation="horizontal">
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btn_open_bili"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_marginEnd="6dp"
+                android:layout_weight="1"
+                android:text="打开 B站" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btn_open_hongguo"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_marginStart="6dp"
+                android:layout_weight="1"
+                android:text="打开红果" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/tv_version"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:gravity="center"
+            android:text="v2.0.0"
+            android:textColor="#C0C0C8"
+            android:textSize="11sp" />
     </LinearLayout>
 </ScrollView>

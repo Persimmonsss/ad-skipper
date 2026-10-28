@@ -1,182 +1,190 @@
 package com.example.hongguo_adskipper
 
 import android.Manifest
-import android.content.BroadcastReceiver
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.provider.Settings
-import android.view.View
+import android.provider.Settings as AndroidSettings
 import android.widget.Button
-import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import com.google.android.material.button.MaterialButton
+import com.google.android.material.materialswitch.MaterialSwitch
 
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var statusText: TextView
-    private lateinit var hintText: TextView
-    private lateinit var settingsBtn: View
-    private lateinit var statsPanel: ScrollView
-    private lateinit var statsContent: TextView
-    private lateinit var screenTextsView: TextView
-    private lateinit var refreshBtn: Button
-
-    private val launcher = registerForActivityResult(
-        ActivityResultContracts.StartActivityForResult()
-    ) { updateUI() }
-
-    private val updateReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) { updateUI() }
-    }
-
-    private val autoRefresh = object : Runnable {
-        override fun run() {
-            updateUI()
-            handler.postDelayed(this, 3000)
-        }
-    }
+    private lateinit var tvA11y: TextView
+    private lateinit var tvNls: TextView
+    private lateinit var tvOverlay: TextView
+    private lateinit var swBili: MaterialSwitch
+    private lateinit var swBubble: MaterialSwitch
+    private lateinit var swSplash: MaterialSwitch
+    private lateinit var swHongguo: MaterialSwitch
+    private lateinit var tvBiliState: TextView
+    private lateinit var tvStats: TextView
+    private lateinit var tvLog: TextView
 
     private val handler = Handler(Looper.getMainLooper())
+    private val refresh = object : Runnable {
+        override fun run() {
+            render()
+            handler.postDelayed(this, 1000)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        statusText = findViewById(R.id.tv_status)
-        hintText = findViewById(R.id.tv_hint)
-        settingsBtn = findViewById(R.id.btn_go_settings)
-        statsPanel = findViewById(R.id.stats_panel)
-        statsContent = findViewById(R.id.tv_stats_content)
-        screenTextsView = findViewById(R.id.tv_screen_texts)
-        refreshBtn = findViewById(R.id.btn_refresh)
+        tvA11y = findViewById(R.id.tv_a11y_status)
+        tvNls = findViewById(R.id.tv_nls_status)
+        tvOverlay = findViewById(R.id.tv_overlay_status)
+        swBili = findViewById(R.id.sw_bili)
+        swBubble = findViewById(R.id.sw_bubble)
+        swSplash = findViewById(R.id.sw_splash)
+        swHongguo = findViewById(R.id.sw_hongguo)
+        tvBiliState = findViewById(R.id.tv_bili_state)
+        tvStats = findViewById(R.id.tv_stats)
+        tvLog = findViewById(R.id.tv_log)
+        findViewById<TextView>(R.id.tv_version).text = "v2.0.0"
 
-        settingsBtn.setOnClickListener { openAccessibilitySettings() }
-        findViewById<View>(R.id.btn_open_hongguo).setOnClickListener { openHongGuoApp() }
-        refreshBtn.setOnClickListener { updateUI() }
+        bindSwitch(swBili) { Settings.biliEnabled = it }
+        bindSwitch(swBubble) { Settings.bubbleEnabled = it }
+        bindSwitch(swSplash) { Settings.splashEnabled = it }
+        bindSwitch(swHongguo) { Settings.hongguoEnabled = it }
 
-        val filter = IntentFilter("com.example.hongguo_adskipper.UPDATE")
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(updateReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        } else {
-            registerReceiver(updateReceiver, filter)
+        findViewById<MaterialButton>(R.id.btn_a11y).setOnClickListener {
+            startActivitySafe(Intent(AndroidSettings.ACTION_ACCESSIBILITY_SETTINGS))
+        }
+        findViewById<MaterialButton>(R.id.btn_nls).setOnClickListener {
+            startActivitySafe(Intent(AndroidSettings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+        }
+        findViewById<MaterialButton>(R.id.btn_overlay).setOnClickListener {
+            startActivitySafe(
+                Intent(AndroidSettings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+            )
+        }
+        findViewById<Button>(R.id.btn_clear_log).setOnClickListener { Stats.clearLogs() }
+        findViewById<MaterialButton>(R.id.btn_open_bili).setOnClickListener {
+            openPackage("tv.danmaku.bili", "未安装 B站")
+        }
+        findViewById<MaterialButton>(R.id.btn_open_hongguo).setOnClickListener {
+            openPackage("com.phoenix.read", "未安装红果短剧")
         }
 
-        updateUI()
-        handler.postDelayed(autoRefresh, 3000)
-
-        // Android 13+ 请求通知权限
         requestNotificationPermission()
-    }
-
-    private fun requestNotificationPermission() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
-                != PackageManager.PERMISSION_GRANTED) {
-                requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 100)
-            }
-        }
     }
 
     override fun onResume() {
         super.onResume()
-        updateUI()
+        render()
+        handler.removeCallbacks(refresh)
+        handler.postDelayed(refresh, 1000)
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        handler.removeCallbacks(autoRefresh)
-        try { unregisterReceiver(updateReceiver) } catch (_: Exception) {}
+    override fun onPause() {
+        super.onPause()
+        handler.removeCallbacks(refresh)
     }
 
-    private fun updateUI() {
-        val svc = AdSkipAccessibilityService
-        val isRunning = isAccessibilityServiceEnabled()
+    private fun bindSwitch(s: MaterialSwitch, onChange: (Boolean) -> Unit) {
+        s.isChecked = when (s.id) {
+            R.id.sw_bili -> Settings.biliEnabled
+            R.id.sw_bubble -> Settings.bubbleEnabled
+            R.id.sw_splash -> Settings.splashEnabled
+            else -> Settings.hongguoEnabled
+        }
+        s.setOnCheckedChangeListener { _, checked -> onChange(checked) }
+    }
 
-        if (isRunning) {
-            statusText.text = "服务运行中 ${AdSkipAccessibilityService.VERSION}"
-            hintText.text = svc.debugLog
-            settingsBtn.visibility = View.GONE
-            statsPanel.visibility = View.VISIBLE
+    private fun render() {
+        val a11y = isA11yEnabled()
+        val nls = isNlsEnabled()
+        val overlay = AndroidSettings.canDrawOverlays(this)
 
-            // 构建统计信息
-            val sb = StringBuilder()
-            sb.append("===== 短剧信息 =====\n")
-            sb.append("剧名: ${svc.dramaTitle}\n")
-            sb.append("集数: ${svc.currentEpisode}\n")
-            sb.append("\n===== 界面检测 =====\n")
-            sb.append("红果前台检测: ${svc.hongguoDetectedCount} 次\n")
-            sb.append("屏幕检查总数: ${svc.screenCheckCount} 次\n")
-            sb.append("采集到文字数: ${svc.lastScreenTexts.size} 条\n")
-            sb.append("\n===== 广告统计 =====\n")
-            sb.append("检测到广告: ${svc.adDetectedCount} 次\n")
-            sb.append("执行滑动: ${svc.adSkipCount} 次\n")
-            sb.append("跳过成功: ${svc.adSkipSuccessCount} 次\n")
-            sb.append("跳过失败: ${svc.adSkipFailCount} 次\n")
-            sb.append("\n===== 最近广告 =====\n")
-            sb.append("命中关键词: ${svc.lastAdKeyword}\n")
-            sb.append("检测时间: ${svc.lastAdTime}\n")
-            sb.append("\n===== 屏幕文字(最新) =====\n")
-            for ((i, t) in svc.lastScreenTexts.take(20).withIndex()) {
-                sb.append("[$i] $t\n")
-            }
-            if (svc.lastScreenTexts.size > 20) {
-                sb.append("... 共${svc.lastScreenTexts.size}条")
-            }
-            statsContent.text = sb.toString()
+        tvA11y.text = if (a11y) "无障碍服务：已开启" else "无障碍服务：未开启（开屏/红果需要）"
+        tvNls.text = if (nls) "通知使用权：已开启" else "通知使用权：未开启（B站跳过需要）"
+        tvOverlay.text = if (overlay) "悬浮窗：已开启" else "悬浮窗：未开启（气泡提示需要）"
 
-            // 屏幕文字快速预览
-            if (svc.lastScreenTexts.isNotEmpty()) {
-                screenTextsView.text = "采集到 ${svc.lastScreenTexts.size} 条文字 (详见下方)"
-                screenTextsView.visibility = View.VISIBLE
+        swBili.isChecked = Settings.biliEnabled
+        swBubble.isChecked = Settings.bubbleEnabled
+        swSplash.isChecked = Settings.splashEnabled
+        swHongguo.isChecked = Settings.hongguoEnabled
+
+        val title = Stats.biliTitle
+        val bvid = Stats.biliBvid
+        val segCount = Stats.biliSegments
+        val pos = Stats.biliPositionMs
+        val dur = Stats.biliDurationMs
+        tvBiliState.text = buildString {
+            append("B站：")
+            if (title == "-") {
+                append(if (BiliPlaybackWatcher.connected) "监听中，等待播放" else "监听未连接")
             } else {
-                screenTextsView.text = "未采集到文字 - 可能红果不在前台"
-                screenTextsView.visibility = View.VISIBLE
+                append(title.take(24))
+                append("\nBV: ").append(bvid ?: "未匹配")
+                append("  广告段: ").append(segCount)
+                append("\n进度: ").append(fmt(pos))
+                if (dur > 0) append(" / ").append(fmt(dur))
             }
-        } else {
-            statusText.text = "服务未开启"
-            hintText.text = "请先开启无障碍服务权限"
-            settingsBtn.visibility = View.VISIBLE
-            statsPanel.visibility = View.GONE
         }
+        tvStats.text = "B站跳过 ${Stats.biliSkipCount} 次（最近 ${Stats.biliLastSkip}） · 开屏点击 ${Stats.splashClickCount} 次" +
+            (Stats.lastError?.let { "\n异常：$it" } ?: "")
+
+        val logs = Stats.logLines()
+        tvLog.text = if (logs.isEmpty()) "等待事件…" else logs.joinToString("\n")
     }
 
-    private fun isAccessibilityServiceEnabled(): Boolean {
-        val name = "${packageName}/${AdSkipAccessibilityService::class.java.canonicalName}"
-        val enabled = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: return false
-        return enabled.contains(name)
+    private fun fmt(ms: Long): String {
+        val s = (ms / 1000).coerceAtLeast(0)
+        return "%02d:%02d".format(s / 60, s % 60)
     }
 
-    private fun openAccessibilitySettings() {
+    private fun isA11yEnabled(): Boolean {
+        val expected = ComponentName(this, AdSkipAccessibilityService::class.java)
+        val enabled = AndroidSettings.Secure.getString(
+            contentResolver, AndroidSettings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+        ) ?: return false
+        return enabled.split(':').any { ComponentName.unflattenFromString(it) == expected }
+    }
+
+    private fun isNlsEnabled(): Boolean {
+        val expected = ComponentName(this, BiliPlaybackWatcher::class.java)
+        val enabled = AndroidSettings.Secure.getString(
+            contentResolver, "enabled_notification_listeners"
+        ) ?: return false
+        return enabled.split(':').any { ComponentName.unflattenFromString(it) == expected }
+    }
+
+    private fun openPackage(pkg: String, msg: String) {
+        val intent = packageManager.getLaunchIntentForPackage(pkg)
+        if (intent == null) toast(msg) else startActivity(intent)
+    }
+
+    private fun startActivitySafe(intent: Intent) {
         try {
-            launcher.launch(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            })
+            startActivity(intent)
         } catch (e: Exception) {
-            Toast.makeText(this, "无法打开无障碍设置", Toast.LENGTH_SHORT).show()
+            toast("无法打开设置页")
         }
     }
 
-    private fun openHongGuoApp() {
-        val packages = listOf("com.phoenix.read", "com.phoenix.read.tv", "cn.xiaochuankeji.zhibo")
-        var launched = false
-        for (pkg in packages) {
-            try {
-                val intent = packageManager.getLaunchIntentForPackage(pkg)
-                if (intent != null) { startActivity(intent); launched = true; break }
-            } catch (_: Exception) {}
-        }
-        if (!launched) {
-            Toast.makeText(this, "未找到红果短剧（尝试了 ${packages.size} 个包名）", Toast.LENGTH_LONG).show()
+    private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+
+    private fun requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 100)
         }
     }
 }
