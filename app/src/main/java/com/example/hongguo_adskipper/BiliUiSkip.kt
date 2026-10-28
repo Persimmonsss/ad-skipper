@@ -27,6 +27,8 @@ class BiliUiSkip(
         private const val SEEK_GUARD_MS = 4000L
         private const val FRESH_MS = 2000L
         private const val MAX_SCAN_NODES = 600
+        private const val UNDO_MS = 3000L
+        private const val UNDO_BACK_MS = 2000L
         private val PROGRESS = Regex("""(\d{1,2}):(\d{2})(?::(\d{2}))?\s*/\s*(\d{1,2}):(\d{2})(?::(\d{2}))?""")
     }
 
@@ -47,13 +49,18 @@ class BiliUiSkip(
     private var lastStateLog = 0L
     private var lastBootstrap = 0L
     private var paused: Boolean? = null
+    private var undoUntil = 0L
+    private var undoTo = 0L
+    private var undoUuid: String? = null
     private val attempts = mutableMapOf<String, Int>()
     private val skipped = mutableSetOf<String>()
 
     /** 由无障碍事件驱动：读一次界面并处理。 */
     fun onEvent(rootProvider: () -> AccessibilityNodeInfo?) {
         val now = SystemClock.elapsedRealtime()
-        if (now - lastScan < SCAN_INTERVAL_MS) return
+        // 没有广告段或已暂停时只为仪表盘刷新进度，没必要 300ms 扫一次
+        val interval = if (Stats.biliSegList.isEmpty() || paused == true) 1000L else SCAN_INTERVAL_MS
+        if (now - lastScan < interval) return
         lastScan = now
         resetIfVideoChanged()
         scanInto(rootProvider())
@@ -62,9 +69,13 @@ class BiliUiSkip(
 
     /** 由服务定时器驱动：控件隐藏时靠外推决定何时唤出控件。 */
     fun tick() {
-        if (!Settings.biliEnabled) return
+        if (!Settings.biliEnabled) {
+            bubble.hide()
+            return
+        }
         if (paused == true) return
         val now = SystemClock.elapsedRealtime()
+        if (now < undoUntil) return
         resetIfVideoChanged()
         val segs = Stats.biliSegList
         if (segs.isEmpty()) return
@@ -100,6 +111,9 @@ class BiliUiSkip(
             pendingSeg = null
             revealedFor = null
             bar = null
+            undoUuid = null
+            undoUntil = 0
+            bubble.hide()
         }
     }
 
@@ -137,12 +151,17 @@ class BiliUiSkip(
             return
         }
         if (pendingSeg != null) return
+        if (now < undoUntil) return
         val segs = Stats.biliSegList
         if (segs.isEmpty() || posMs < 0) return
         val est = posMs + (now - posAt)
 
         val seg = segs.firstOrNull { est >= it.startMs - LEAD_MS && est < it.endMs }
         if (seg == null) {
+            bubble.hide()
+            return
+        }
+        if (skipped.contains(seg.uuid)) {
             bubble.hide()
             return
         }
@@ -155,7 +174,7 @@ class BiliUiSkip(
             }
             return
         }
-        if (skipped.contains(seg.uuid) || now - lastSeekAt < SEEK_GUARD_MS) return
+        if (now - lastSeekAt < SEEK_GUARD_MS) return
         val tries = attempts[seg.uuid] ?: 0
         if (tries >= 3) {
             skipped.add(seg.uuid)
@@ -239,6 +258,86 @@ class BiliUiSkip(
         Stats.biliSkipCount++
         Stats.biliLastSkip = "${fmt(seg.startMs)} → ${fmt(seg.endMs)}"
         Stats.log("seek 生效（${if (at.first) "界面" else "会话"}），当前 ${fmt(at.second)}")
+        offerUndo(seg)
+    }
+
+    /** 跳过生效后 3 秒内可点气泡撤回，回到广告前 2 秒。 */
+    private fun offerUndo(seg: AdSegment) {
+        val now = SystemClock.elapsedRealtime()
+        undoUntil = now + UNDO_MS
+        undoTo = (seg.startMs - UNDO_BACK_MS).coerceAtLeast(0)
+        undoUuid = seg.uuid
+        bubble.show("已跳过广告", "撤回") { undo(seg) }
+        main.postDelayed({
+            if (undoUuid == seg.uuid && SystemClock.elapsedRealtime() >= undoUntil) {
+                undoUuid = null
+                undoUntil = 0
+                bubble.hide()
+            }
+        }, UNDO_MS + 60)
+    }
+
+    private fun undo(seg: AdSegment) {
+        if (undoUuid != seg.uuid || SystemClock.elapsedRealtime() > undoUntil) {
+            bubble.hide()
+            return
+        }
+        val to = undoTo
+        undoUuid = null
+        undoUntil = 0
+        bubble.hide()
+        if (BiliPlaybackWatcher.seekBili(to)) {
+            applyUndo(to)
+            return
+        }
+        // 控件可能已隐藏，先唤出再拖
+        if (bar == null) revealControls()
+        main.postDelayed({
+            lastScan = 0
+            scanInto(service.rootInActiveWindow)
+            val est = posMs + (SystemClock.elapsedRealtime() - posAt)
+            if (dragBarTo(est, to)) applyUndo(to) else Stats.log("撤回失败：播放器未响应")
+        }, if (bar == null) 700 else 0)
+    }
+
+    private fun applyUndo(to: Long) {
+        lastSeekAt = SystemClock.elapsedRealtime()
+        posMs = to
+        posAt = SystemClock.elapsedRealtime()
+        Stats.biliPositionMs = posMs
+        if (Stats.biliSkipCount > 0) Stats.biliSkipCount--
+        Stats.biliLastSkip = "已撤回 → ${fmt(to)}"
+        Stats.log("撤回跳过，回到 ${fmt(to)}")
+        main.postDelayed({ verifyUndo(to) }, 1200)
+    }
+
+    /** 会话 seek 可能被播放器忽略：读界面/会话复核，不一致就改用拖动再撤一次。 */
+    private fun verifyUndo(to: Long) {
+        lastScan = 0
+        scanInto(service.rootInActiveWindow)
+        val fresh = SystemClock.elapsedRealtime() - posAt < 500
+        val uiOk = fresh && Math.abs(posMs - to) <= 6000
+        val session = BiliPlaybackWatcher.biliPositionMs()
+        val sessionOk = session != null && Math.abs(session - to) <= 6000
+        if (uiOk || sessionOk) return
+        Stats.log("撤回未生效（${fmt(posMs)}），改用拖动")
+        if (bar == null) revealControls()
+        main.postDelayed({
+            lastScan = 0
+            scanInto(service.rootInActiveWindow)
+            val from = posMs + (SystemClock.elapsedRealtime() - posAt)
+            if (dragBarTo(from, to)) {
+                lastSeekAt = SystemClock.elapsedRealtime()
+                posMs = to
+                posAt = SystemClock.elapsedRealtime()
+                Stats.biliPositionMs = to
+                Stats.biliLastSkip = "已撤回 → ${fmt(to)}"
+                Stats.log("撤回拖动生效，回到 ${fmt(to)}")
+            } else {
+                Stats.biliLastSkip = "撤回未生效（${fmt(posMs)}）"
+                Stats.log("撤回失败：播放器未响应")
+            }
+        }, if (bar == null) 700 else 0)
     }
 
     private fun dragPath(seg: AdSegment) {
@@ -284,25 +383,9 @@ class BiliUiSkip(
     }
 
     private fun dragTo(seg: AdSegment) {
-        val r = bar ?: return
-        val dur = durMs
-        if (dur <= 0 || posMs < 0) return
         val target = seg.endMs + 300
         val est = posMs + (SystemClock.elapsedRealtime() - posAt)
-        val y = r.exactCenterY()
-        val fromX = (r.left + (est.toFloat() / dur) * r.width()).coerceIn(r.left + 2f, r.right - 2f)
-        val toX = (r.left + (target.toFloat() / dur) * r.width()).coerceIn(r.left + 2f, r.right - 2f)
-        val path = Path().apply {
-            moveTo(fromX, y)
-            lineTo(toX, y)
-        }
-        val gesture = GestureDescription.Builder()
-            .addStroke(GestureDescription.StrokeDescription(path, 0, 500L))
-            .build()
-        if (!service.dispatchGesture(gesture, null, null)) {
-            Stats.log("拖动进度条失败")
-            return
-        }
+        if (!dragBarTo(est, target)) return
         lastSeekAt = SystemClock.elapsedRealtime()
         skipped.add(seg.uuid)
         pendingSeg = seg
@@ -312,6 +395,28 @@ class BiliUiSkip(
         bubble.hide()
         Stats.log("拖动进度条 ${fmt(est)}→${fmt(target)}")
         main.postDelayed({ verifySkip() }, 1600)
+    }
+
+    /** 在进度条上从 fromMs 拖到 toMs；失败返回 false。 */
+    private fun dragBarTo(fromMs: Long, toMs: Long): Boolean {
+        val r = bar ?: return false
+        val dur = durMs
+        if (dur <= 0 || posMs < 0) return false
+        val y = r.exactCenterY()
+        val fromX = (r.left + (fromMs.toFloat() / dur) * r.width()).coerceIn(r.left + 2f, r.right - 2f)
+        val toX = (r.left + (toMs.toFloat() / dur) * r.width()).coerceIn(r.left + 2f, r.right - 2f)
+        val path = Path().apply {
+            moveTo(fromX, y)
+            lineTo(toX, y)
+        }
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0, 500L))
+            .build()
+        if (!service.dispatchGesture(gesture, null, null)) {
+            Stats.log("拖动进度条失败")
+            return false
+        }
+        return true
     }
 
     private fun tap(x: Float, y: Float) {

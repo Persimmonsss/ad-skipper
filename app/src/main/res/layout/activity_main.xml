@@ -168,7 +168,7 @@
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="关掉后静默跳，不弹任何提示"
+                android:text="关掉后不显示倒计时，跳过后仍弹出撤回按钮"
                 android:textColor="#9A9AA2"
                 android:textSize="11sp" />
 
