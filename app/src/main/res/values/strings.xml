@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">红果广告跳过器</string>
+    <string name="accessibility_service_description">红果短剧广告自动跳过服务。本服务仅在红果短剧中运行，检测到广告页面时会自动上滑跳过。不会收集任何用户数据。</string>
+</resources>
