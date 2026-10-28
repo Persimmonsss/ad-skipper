@@ -12,6 +12,7 @@ import android.graphics.Rect
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
 import android.view.WindowManager
@@ -52,7 +53,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
         private const val SPLASH_WINDOW_MS = 10000L
         private const val SPLASH_SCAN_STEP_MS = 300L
         private const val SPLASH_CLICK_CD_MS = 1000L
-        private const val SPLASH_MAX_CLICKS = 3
+        private const val SPLASH_MAX_CLICKS = 2
         private val SKIP_LABEL = Regex("""(?i)^(跳过|跳過|关闭|關閉|skip|close)(广告|廣告)?(\s*\d+\s*[s秒]?)?$""")
         private const val SPLASH_SKIP_PKGS =
             "com.android.systemui,com.android.launcher,com.android.settings,com.phoenix.read"
@@ -123,7 +124,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
     private val biliTicker = object : Runnable {
         override fun run() {
             try {
-                if (foregroundPkg == BiliUiSkip.BILI_PKG) biliUi.tick()
+                if (screenOn() && foregroundPkg == BiliUiSkip.BILI_PKG) biliUi.tick()
             } catch (e: Exception) {
                 Log.w(TAG, "B站定时检查异常: ${e.message}")
             }
@@ -267,6 +268,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
     // ==================== 定时轮询 ====================
 
     private fun performPeriodicCheck() {
+        if (!screenOn()) return
         // 兜底刷新前台包名（事件丢失时靠它恢复）
         if (SystemClock.elapsedRealtime() - foregroundAt > 30_000) {
             foregroundPkg = activeWindowPackage()
@@ -305,6 +307,14 @@ class AdSkipAccessibilityService : AccessibilityService() {
         } finally {
         }
     }
+
+    /** 息屏后不再读取界面节点，省电。 */
+    private fun screenOn(): Boolean =
+        try {
+            getSystemService(PowerManager::class.java).isInteractive
+        } catch (e: Exception) {
+            true
+        }
 
     /** 活动窗口的包名比 rootInActiveWindow 更早跟上 App 切换。 */
     private fun activeWindowPackage(): String {
@@ -590,7 +600,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
     private val splashTicker = object : Runnable {
         override fun run() {
             val now = SystemClock.elapsedRealtime()
-            if (now > splashUntil) return
+            if (now > splashUntil || !screenOn()) return
             try {
                 scanSplashOnce(now)
             } catch (e: Exception) {

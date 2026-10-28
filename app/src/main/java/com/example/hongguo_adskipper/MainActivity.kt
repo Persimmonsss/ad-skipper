@@ -137,6 +137,9 @@ class MainActivity : AppCompatActivity() {
             }
         }
         tvStats.text = "B站跳过 ${Stats.biliSkipCount} 次（最近 ${Stats.biliLastSkip}） · 开屏点击 ${Stats.splashClickCount} 次" +
+            "\n红果检测 ${AdSkipAccessibilityService.adDetectedCount} 次" +
+            " · 滑动 ${AdSkipAccessibilityService.adSkipCount} 次" +
+            " · 成功 ${AdSkipAccessibilityService.adSkipSuccessCount} 次" +
             (Stats.lastError?.let { "\n异常：$it" } ?: "")
 
         val logs = Stats.logLines()
