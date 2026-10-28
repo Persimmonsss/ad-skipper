@@ -31,6 +31,7 @@ object BiliSegmentRepo {
             Stats.log("搜索无结果：${title.take(20)}")
             return null
         }
+        Stats.log("搜索命中 ${candidates.size} 条候选")
         // 优先取社区库里有 sponsor 片段的候选，避免同名视频误匹配
         for ((aid, _) in candidates.take(3)) {
             val bvid = AvBv.av2bv(aid)
@@ -46,29 +47,66 @@ object BiliSegmentRepo {
         return fallback
     }
 
+    /**
+     * 整句标题（带标点、很长）拿去搜索，B站 常返回一堆相似但不相干的视频；
+     * 用第一个分句当关键词，召回结果里再做相似度匹配。
+     */
+    private fun searchKeyword(title: String): String {
+        val head = title.split('，', ',', '。', '！', '？', ' ', '|', '｜', '：', ':')
+            .firstOrNull { it.isNotBlank() }?.trim().orEmpty()
+        return (if (head.length >= 4) head else title).take(24)
+    }
+
     /** 返回 aid + 时长秒数 */
     private fun searchCandidates(title: String): List<Pair<Long, Int>> {
-        val url = "https://app.bilibili.com/x/v2/search?keyword=${URLEncoder.encode(title, "UTF-8")}&build=7000300"
+        val keyword = searchKeyword(title)
+        val url = "https://app.bilibili.com/x/v2/search?keyword=${URLEncoder.encode(keyword, "UTF-8")}&build=7000300"
         val body = httpGet(url) ?: return emptyList()
         return try {
             val root = JSONObject(body)
             val items = root.optJSONObject("data")?.optJSONArray("item") ?: JSONArray()
+            Stats.log("搜索返回 ${items.length()} 条（code=${root.optInt("code")}）")
             val want = normalize(title)
-            val result = mutableListOf<Pair<Long, Int>>()
+            // aid / 时长 / 相似度；标题可能被加尾注或标点差异，不能只认完全相等
+            val scored = mutableListOf<Triple<Long, Int, Int>>()
+            var firstTitle = ""
             for (i in 0 until items.length()) {
                 val item = items.optJSONObject(i) ?: continue
                 val t = normalize(stripTags(item.optString("title")))
+                if (i == 0) firstTitle = t
                 val aid = item.optString("param").toLongOrNull()
-                    ?: item.optString("bvid").toLongOrNull()
                     ?: item.optLong("aid", 0L).takeIf { it > 0 }
                     ?: continue
-                if (t == want) result.add(aid to parseDuration(item.optString("duration")))
+                val dur = parseDuration(item.optString("duration"))
+                val score = when {
+                    t == want -> 1000
+                    t.contains(want) || want.contains(t) -> 500 + minOf(t.length, want.length)
+                    else -> commonPrefix(t, want)
+                }
+                if (score >= 8 && durationCompatible(dur)) scored.add(Triple(aid, dur, score))
             }
-            result
+            scored.sortByDescending { it.third }
+            if (scored.isEmpty() && firstTitle.isNotEmpty()) {
+                Stats.log("无匹配候选：want(${want.length})=${want.take(20)} / first(${firstTitle.length})=${firstTitle.take(20)}")
+            }
+            scored.map { it.first to it.second }
         } catch (e: Exception) {
             Stats.log("搜索解析失败：${e.message}")
             emptyList()
         }
+    }
+
+    private fun commonPrefix(a: String, b: String): Int {
+        var i = 0
+        while (i < a.length && i < b.length && a[i] == b[i]) i++
+        return i
+    }
+
+    /** 时长已知时要求接近（±5 秒），未知则不拦。 */
+    private fun durationCompatible(searchSec: Int): Boolean {
+        val curSec = Stats.biliDurationMs / 1000
+        if (searchSec <= 0 || curSec <= 0) return true
+        return kotlin.math.abs(searchSec - curSec) <= 5
     }
 
     fun fetchSegments(bvid: String): List<AdSegment> {
