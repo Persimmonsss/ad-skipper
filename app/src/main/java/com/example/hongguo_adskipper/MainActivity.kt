@@ -54,7 +54,7 @@ class MainActivity : AppCompatActivity() {
         tvBiliState = findViewById(R.id.tv_bili_state)
         tvStats = findViewById(R.id.tv_stats)
         tvLog = findViewById(R.id.tv_log)
-        findViewById<TextView>(R.id.tv_version).text = "v2.0.0"
+        findViewById<TextView>(R.id.tv_version).text = "v2.1.0"
 
         bindSwitch(swBili) { Settings.biliEnabled = it }
         bindSwitch(swBubble) { Settings.bubbleEnabled = it }
