@@ -44,6 +44,22 @@ class AdSkipAccessibilityService : AccessibilityService() {
         )
 
         private const val CHECK_INTERVAL_MS = 2000L
+
+        // 轮询里反复用到，预编译避免每次检测都新建正则
+        private val RE_BARE_DIGIT = Regex("""^\d{1,2}$""")
+        private val RE_COUNTDOWN = listOf(
+            Regex("""\d{1,2}s"""), Regex("""\d{1,2}s后"""),
+            Regex("""\d{1,2}秒后"""), RE_BARE_DIGIT
+        )
+        private val RE_EPISODE = listOf(
+            Regex("""第\s*(\d+)\s*集"""),
+            Regex("""[Ee]pisode\s*(\d+)"""),
+            Regex("""^\s*(\d+)\s*/\s*\d+\s*$""")
+        )
+        private val RE_INT = Regex("""\d+""")
+        private val RE_CLOCK = Regex("""\d{1,2}:\d{2}""")
+        private val RE_CLOCK3 = Regex("""\d{1,2}:\d{2}:\d{2}""")
+        private val RE_AD_ID = Regex(""".*\bad\b.*""")
         private const val SWIPE_DELAY_MS = 3000L
         private const val AD_WAIT_MS = 1500L
         private const val MAX_CONSECUTIVE_SWIPES = 3
@@ -121,15 +137,21 @@ class AdSkipAccessibilityService : AccessibilityService() {
         }
     }
 
+    /** B站前台时才跑；离开 B站即停，避免常驻 1s 唤醒。 */
     private val biliTicker = object : Runnable {
         override fun run() {
+            if (foregroundPkg != BiliUiSkip.BILI_PKG || !screenOn()) return
             try {
-                if (screenOn() && foregroundPkg == BiliUiSkip.BILI_PKG) biliUi.tick()
+                biliUi.tick()
             } catch (e: Exception) {
                 Log.w(TAG, "B站定时检查异常: ${e.message}")
             }
             handler.postDelayed(this, 1000L)
         }
+    }
+
+    private fun ensureBiliTicker() {
+        if (!handler.hasCallbacks(biliTicker)) handler.postDelayed(biliTicker, 1000L)
     }
 
     override fun onCreate() {
@@ -147,7 +169,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
         handler.removeCallbacks(periodicCheck)
         handler.removeCallbacks(biliTicker)
         handler.postDelayed(periodicCheck, CHECK_INTERVAL_MS)
-        handler.postDelayed(biliTicker, 1000L)
+        if (foregroundPkg == BiliUiSkip.BILI_PKG) ensureBiliTicker()
         logDebug("服务已启动 $VERSION")
     }
 
@@ -240,6 +262,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
             if (Settings.biliEnabled) {
                 try {
                     biliUi.onEvent { rootInActiveWindow }
+                    ensureBiliTicker()
                 } catch (e: Exception) {
                     Log.w(TAG, "B站跳转异常: ${e.message}")
                 }
@@ -274,6 +297,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
             foregroundPkg = activeWindowPackage()
             foregroundAt = SystemClock.elapsedRealtime()
         }
+        if (foregroundPkg == BiliUiSkip.BILI_PKG) ensureBiliTicker()
         if (!Settings.hongguoEnabled) return
         // 按需唤醒：只有红果在前台才扫描界面
         if (!TARGET_PACKAGES.contains(foregroundPkg)) return
@@ -421,12 +445,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
             if (trimmed.isEmpty()) continue
 
             // 检测集数（如 "第3集", "第03集", "Episode 5", "更新至第12集"）
-            val episodePatterns = listOf(
-                Regex("""第\s*(\d+)\s*集"""),
-                Regex("""[Ee]pisode\s*(\d+)"""),
-                Regex("""^\s*(\d+)\s*/\s*\d+\s*$""")  // "3/24" 格式
-            )
-            for (pattern in episodePatterns) {
+            for (pattern in RE_EPISODE) {
                 val match = pattern.find(trimmed)
                 if (match != null) {
                     currentEpisode = "第${match.groupValues[1]}集"
@@ -437,12 +456,12 @@ class AdSkipAccessibilityService : AccessibilityService() {
             // 排除按钮文字和广告文字
             if (trimmed.length >= 4 && trimmed.length <= 30 &&
                 !isAdKeyword(trimmed) &&
-                !trimmed.matches(Regex("""\d+""")) &&
+                !RE_INT.matches(trimmed) &&
                 !trimmed.contains("免费") &&
                 !trimmed.contains("下载") &&
                 !trimmed.contains("打开") &&
-                !trimmed.matches(Regex("""\d{1,2}:\d{2}""")) &&  // 时间
-                !trimmed.matches(Regex("""\d{1,2}:\d{2}:\d{2}"""))  // 时间
+                !RE_CLOCK.matches(trimmed) &&
+                !RE_CLOCK3.matches(trimmed)
             ) {
                 // 可能是短剧标题
                 if (dramaTitle == "未检测到" || trimmed.length > dramaTitle.length) {
@@ -481,11 +500,11 @@ class AdSkipAccessibilityService : AccessibilityService() {
 
         // 策略2：倒计时
         // 选集面板等信息流页面会有一堆纯数字节点，不能当倒计时
-        val bareDigits = allTexts.count { Regex("""^\d{1,2}$""").matches(it.trim()) }
+        val bareDigits = allTexts.count { RE_BARE_DIGIT.matches(it.trim()) }
         for (text in allTexts) {
             val trimmed = text.trim()
             if (!matchesAdCountdown(trimmed)) continue
-            if (bareDigits >= 3 && Regex("""^\d{1,2}$""").matches(trimmed)) continue
+            if (bareDigits >= 3 && RE_BARE_DIGIT.matches(trimmed)) continue
             lastAdKeyword = "倒计时:\"$trimmed\""
             return true
         }
@@ -520,11 +539,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
     }
 
     private fun matchesAdCountdown(text: String): Boolean {
-        val patterns = listOf(
-            Regex("""\d{1,2}s"""), Regex("""\d{1,2}s后"""),
-            Regex("""\d{1,2}秒后"""), Regex("""^\d{1,2}$""")
-        )
-        for (p in patterns) {
+        for (p in RE_COUNTDOWN) {
             if (p.containsMatchIn(text) && text.length <= 10) {
                 if (text.length == 2 && text.all { it.isDigit() }) continue
                 return true
@@ -539,7 +554,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
         if (depth > maxDepth) return false
         node.viewIdResourceName?.let { id ->
             val lower = id.lowercase()
-            if (lower.matches(Regex(".*\\bad\\b.*")) && !lower.contains("download") && !lower.contains("update")) return true
+            if (RE_AD_ID.matches(lower) && !lower.contains("download") && !lower.contains("update")) return true
             if (lower.contains("splash_ad") || lower.contains("banner_ad") || lower.contains("ad_container") || lower.contains("ad_layout") || lower.contains("skip_ad")) return true
         }
         node.className?.let { cls ->
@@ -662,8 +677,11 @@ class AdSkipAccessibilityService : AccessibilityService() {
             logDebug("开屏树：${samples.joinToString(" / ").take(120)}")
             logDebug("开屏窗口数 ${windows.size}：${windowBrief()}")
         }
-        // 兜底：纯图片广告不暴露节点（页面几乎没有文字）时，点右上角常见的跳过位置
-        if (samples.size <= 3 && now - splashWindowStart > 2500 && splashCornerClicks < 2) {
+        // 兜底：纯图片广告不暴露节点（页面几乎没有文字）时，点右上角常见的跳过位置。
+        // B站 首页/视频页刚加载时也没有文字节点，盲点会误触播放器，故不对 B站 兜底。
+        if (samples.size <= 3 && now - splashWindowStart > 2500 && splashCornerClicks < 2 &&
+            pkg != BiliUiSkip.BILI_PKG
+        ) {
             splashCornerClicks++
             splashClickCount++
             lastSplashClick = now
