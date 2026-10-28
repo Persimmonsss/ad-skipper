@@ -14,6 +14,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 
@@ -52,6 +53,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
         private const val SPLASH_SCAN_STEP_MS = 300L
         private const val SPLASH_CLICK_CD_MS = 1000L
         private const val SPLASH_MAX_CLICKS = 3
+        private val SKIP_LABEL = Regex("""(?i)^(跳过|跳過|关闭|關閉|skip|close)(广告|廣告)?(\s*\d+\s*[s秒]?)?$""")
         private const val SPLASH_SKIP_PKGS =
             "com.android.systemui,com.android.launcher,com.android.settings,com.phoenix.read"
 
@@ -137,6 +139,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         isServiceEnabled = true
+        foregroundPkg = activeWindowPackage()
+        foregroundAt = SystemClock.elapsedRealtime()
         createNotificationChannel()
         showNotification()
         handler.removeCallbacks(periodicCheck)
@@ -219,13 +223,14 @@ class AdSkipAccessibilityService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
         val pkg = event.packageName?.toString()
+        val appSwitched = pkg != null && pkg != foregroundPkg
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && pkg != null) {
             foregroundPkg = pkg
             foregroundAt = SystemClock.elapsedRealtime()
         }
         if (Settings.splashEnabled) {
             try {
-                handleSplashEvent(event)
+                handleSplashEvent(event, appSwitched)
             } catch (e: Exception) {
                 Log.w(TAG, "开屏检测异常: ${e.message}")
             }
@@ -242,7 +247,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
         }
         if (!Settings.hongguoEnabled) return
         if (!TARGET_PACKAGES.contains(pkg)) return
-        if (pkg != null) foregroundPkg = pkg
+        // 刚切走 App 的残留事件不能算数，否则别的 App 启动瞬间会误滑
+        if (pkg != foregroundPkg) return
         val currentTime = System.currentTimeMillis()
         if (currentTime - lastSwipeTime < SWIPE_DELAY_MS) return
         if (consecutiveSwipes >= MAX_CONSECUTIVE_SWIPES) {
@@ -250,6 +256,9 @@ class AdSkipAccessibilityService : AccessibilityService() {
             else return
         }
         val rootNode = rootInActiveWindow ?: return
+        // 事件可能来自刚切走的 App，而活动窗口已是新 App
+        if (activeWindowPackage() != pkg) return
+        if (rootNode.packageName?.toString() != pkg) return
         try {
             processScreen(rootNode, currentTime, fromEvent = true)
         } finally {
@@ -261,12 +270,14 @@ class AdSkipAccessibilityService : AccessibilityService() {
     private fun performPeriodicCheck() {
         // 兜底刷新前台包名（事件丢失时靠它恢复）
         if (SystemClock.elapsedRealtime() - foregroundAt > 30_000) {
-            foregroundPkg = rootInActiveWindow?.packageName?.toString().orEmpty()
+            foregroundPkg = activeWindowPackage()
             foregroundAt = SystemClock.elapsedRealtime()
         }
         if (!Settings.hongguoEnabled) return
         // 按需唤醒：只有红果在前台才扫描界面
         if (!TARGET_PACKAGES.contains(foregroundPkg)) return
+        // 启动切换瞬间 rootInActiveWindow 可能仍是上一个 App，以活动窗口为准
+        if (!TARGET_PACKAGES.contains(activeWindowPackage())) return
         val rootNode = rootInActiveWindow
         if (rootNode == null) {
             // 每20次打印一次"等待窗口"日志，避免刷屏
@@ -280,6 +291,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
             foregroundPkg = packageName
             return
         }
+        // 启动切换瞬间根窗口可能还是上一个 App，必须与前台包名一致才处理
+        if (packageName != foregroundPkg) return
         val currentTime = System.currentTimeMillis()
         if (currentTime - lastSwipeTime < SWIPE_DELAY_MS) {
             return
@@ -292,6 +305,16 @@ class AdSkipAccessibilityService : AccessibilityService() {
             processScreen(rootNode, currentTime, fromEvent = false)
         } finally {
         }
+    }
+
+    /** 活动窗口的包名比 rootInActiveWindow 更早跟上 App 切换。 */
+    private fun activeWindowPackage(): String {
+        val fromWindows = try {
+            windows.firstOrNull { it.isActive }?.root?.packageName?.toString()
+        } catch (e: Exception) {
+            null
+        }
+        return fromWindows ?: rootInActiveWindow?.packageName?.toString().orEmpty()
     }
 
     // ==================== 核心处理：采集 + 检测广告 ====================
@@ -545,41 +568,132 @@ class AdSkipAccessibilityService : AccessibilityService() {
 
     private var splashPkg: String? = null
     private var splashWindowStart = 0L
+    private var splashUntil = 0L
     private var splashClickCount = 0
+    private var splashSamples = 0
+    private var splashCornerClicks = 0
     private var lastSplashClick = 0L
     private var lastSplashScan = 0L
 
-    private fun handleSplashEvent(event: AccessibilityEvent) {
+    /** 开屏窗口出现后独立轮询若干秒：广告窗口常常不产生无障碍事件。 */
+    private val splashTicker = object : Runnable {
+        override fun run() {
+            val now = SystemClock.elapsedRealtime()
+            if (now > splashUntil) return
+            try {
+                scanSplashOnce(now)
+            } catch (e: Exception) {
+                Log.w(TAG, "开屏扫描异常: ${e.message}")
+            }
+            handler.postDelayed(this, 250L)
+        }
+    }
+
+    private fun handleSplashEvent(event: AccessibilityEvent, appSwitched: Boolean) {
+        if (!Settings.splashEnabled) return
         val pkg = event.packageName?.toString() ?: return
         if (pkg == packageName) return
         if (SPLASH_SKIP_PKGS.split(",").any { pkg == it || pkg.startsWith("$it.") }) return
+        if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
+        // 只认 App 切换后的首个窗口，避免在同一个 App 内反复扫描误点普通"关闭"
+        if (!appSwitched) return
         val now = SystemClock.elapsedRealtime()
-        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && pkg != splashPkg) {
-            splashPkg = pkg
-            splashWindowStart = now
-            splashClickCount = 0
-        }
-        if (pkg != splashPkg) return
-        if (now - splashWindowStart > SPLASH_WINDOW_MS) return
+        splashPkg = pkg
+        splashWindowStart = now
+        splashUntil = now + SPLASH_WINDOW_MS
+        splashClickCount = 0
+        splashSamples = 0
+        splashCornerClicks = 0
+        lastSplashClick = 0
+        lastSplashScan = 0
+        handler.removeCallbacks(splashTicker)
+        handler.post(splashTicker)
+        logDebug("开屏窗口 $pkg")
+    }
+
+    private fun scanSplashOnce(now: Long) {
+        val pkg = splashPkg ?: return
         if (splashClickCount >= SPLASH_MAX_CLICKS) return
         if (now - lastSplashClick < SPLASH_CLICK_CD_MS) return
         if (now - lastSplashScan < SPLASH_SCAN_STEP_MS) return
         lastSplashScan = now
 
-        val root = rootInActiveWindow ?: return
-        if (root.packageName?.toString() != pkg) return
-        val node = findSplashSkipNode(root, 0, 14) ?: return
-        if (clickNode(node)) {
-            splashClickCount++
-            lastSplashClick = SystemClock.elapsedRealtime()
-            Stats.splashClickCount++
-            val label = node.text?.toString()?.take(8)
-                ?: node.contentDescription?.toString()?.take(8)
-                ?: node.viewIdResourceName?.substringAfterLast('/')
-                ?: "?"
-            Stats.splashLastTarget = "${pkg.substringAfterLast('.')}:$label"
-            Stats.log("开屏跳过 ${Stats.splashLastTarget}")
+        val roots = splashRoots(pkg)
+        if (roots.isEmpty()) return
+        val node = roots.firstNotNullOfOrNull { findSplashSkipNode(it, 0, 16) }
+        if (node != null) {
+            if (clickNode(node)) {
+                splashClickCount++
+                lastSplashClick = SystemClock.elapsedRealtime()
+                Stats.splashClickCount++
+                val label = node.text?.toString()?.take(8)
+                    ?: node.contentDescription?.toString()?.take(8)
+                    ?: node.viewIdResourceName?.substringAfterLast('/')
+                    ?: "?"
+                Stats.splashLastTarget = "${pkg.substringAfterLast('.')}:$label"
+                Stats.log("开屏跳过 ${Stats.splashLastTarget}")
+            }
+            return
         }
+        val samples = roots.flatMap { sampleList(it, 8) }
+        if (splashSamples < 2) {
+            splashSamples++
+            logDebug("开屏树：${samples.joinToString(" / ").take(120)}")
+            logDebug("开屏窗口数 ${windows.size}：${windowBrief()}")
+        }
+        // 兜底：纯图片广告不暴露节点（页面几乎没有文字）时，点右上角常见的跳过位置
+        if (samples.size <= 3 && now - splashWindowStart > 2500 && splashCornerClicks < 2) {
+            splashCornerClicks++
+            splashClickCount++
+            lastSplashClick = now
+            tapAt(0.88f, 0.085f)
+            Stats.log("开屏兜底点击右上角")
+        }
+    }
+
+    /** 广告可能挂在独立窗口上，rootInActiveWindow 里看不到。 */
+    private fun splashRoots(pkg: String): List<AccessibilityNodeInfo> {
+        val out = ArrayList<AccessibilityNodeInfo>()
+        try {
+            for (w in windows) {
+                val root = w.root ?: continue
+                if (root.packageName?.toString() != pkg) continue
+                if (!out.contains(root)) out.add(root)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "枚举窗口失败: ${e.message}")
+        }
+        if (out.isEmpty()) {
+            rootInActiveWindow?.let { if (it.packageName?.toString() == pkg) out.add(it) }
+        }
+        return out
+    }
+
+    private fun windowBrief(): String {
+        val parts = ArrayList<String>()
+        try {
+            for (w in windows) {
+                val root = w.root
+                parts.add("${w.type}:${root?.packageName?.toString()?.substringAfterLast('.') ?: "?"}")
+            }
+        } catch (e: Exception) {
+            parts.add("err")
+        }
+        return parts.joinToString(",")
+    }
+
+    private fun tapAt(fx: Float, fy: Float) {
+        val (w, h) = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val b = getSystemService(WindowManager::class.java).currentWindowMetrics.bounds
+            b.width() to b.height()
+        } else {
+            resources.displayMetrics.let { it.widthPixels to it.heightPixels }
+        }
+        val path = Path().apply { moveTo(w * fx, h * fy) }
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0, 60L))
+            .build()
+        dispatchGesture(gesture, null, null)
     }
 
     private fun findSplashSkipNode(
@@ -600,16 +714,9 @@ class AdSkipAccessibilityService : AccessibilityService() {
     }
 
     private fun isSkipLabel(t: String): Boolean {
-        if (t.isEmpty() || t.length > 10) return false
-        val s = t.lowercase()
-        if (s == "跳过" || s == "跳過" || s == "关闭" || s == "關閉" ||
-            s == "skip" || s == "close" || s == "跳过广告" || s == "关闭广告"
-        ) return true
-        if (s.startsWith("跳") && t.length <= 4) return true
-        if (s.startsWith("跳过") && t.length <= 8) return true
-        if (s.startsWith("关闭") && t.length <= 8) return true
-        if (s.contains("跳过广告")) return true
-        return false
+        val s = t.trim()
+        if (s.isEmpty() || s.length > 10) return false
+        return SKIP_LABEL.matches(s) || s.contains("跳过广告") || s.contains("关闭广告")
     }
 
     private fun isSkipViewId(id: String): Boolean {
@@ -617,6 +724,19 @@ class AdSkipAccessibilityService : AccessibilityService() {
         if (id.contains("download") || id.contains("update")) return false
         return id.contains("skip_ad") || id.contains("ad_skip") || id.contains("count_down") ||
                 id.contains("splash_ad") || id.contains("skip_view") || id.contains("close_ad")
+    }
+
+    private fun sampleList(root: AccessibilityNodeInfo, limit: Int = 12): List<String> {
+        val out = ArrayList<String>()
+        fun walk(n: AccessibilityNodeInfo, d: Int) {
+            if (d > 14 || out.size >= limit) return
+            val t = n.text?.toString()?.takeIf { it.isNotBlank() }
+                ?: n.contentDescription?.toString()?.takeIf { it.isNotBlank() }
+            if (t != null) out.add(t.take(12))
+            for (i in 0 until n.childCount) n.getChild(i)?.let { walk(it, d + 1) }
+        }
+        walk(root, 0)
+        return out
     }
 
     private fun clickableTarget(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
