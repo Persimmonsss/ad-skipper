@@ -241,7 +241,7 @@ class BiliUiSkip(
 
     /** 优先会话 seek（精确、不需要控件），失败再退回拖进度条。 */
     private fun startSkip(seg: AdSegment) {
-        val target = seg.endMs + 300
+        val target = skipTargetMs(seg)
         val before = BiliPlaybackWatcher.biliPositionMs()
         if (BiliPlaybackWatcher.seekBili(target)) {
             lastSeekAt = SystemClock.elapsedRealtime()
@@ -251,7 +251,7 @@ class BiliUiSkip(
             pendingBeforePos = before
             lastStateLog = 0
             bubble.hide()
-            Stats.log("会话 seek ${fmt(seg.startMs)}→${fmt(seg.endMs)}")
+            Stats.log("会话 seek ${fmt(seg.startMs)}→${fmt(target)}")
             main.postDelayed({ verifySkip() }, 1500)
             return
         }
@@ -445,8 +445,17 @@ class BiliUiSkip(
         tap(m.widthPixels / 2f, m.heightPixels * 0.22f)
     }
 
+    /**
+     * 跳过目标。广告一直顶到片尾时（实测 BV1imaN6tEK3，片段 11:07.3–13:28.3 = 片长），
+     * 目标必须留在片长内：seek 越过片长会被播放器当成"没这条片段"处理，直接从 00:01 重播。
+     */
+    private fun skipTargetMs(seg: AdSegment): Long {
+        val raw = seg.endMs + 300
+        return if (durMs > 0) minOf(raw, durMs - 1500).coerceAtLeast(0) else raw
+    }
+
     private fun dragTo(seg: AdSegment) {
-        val target = seg.endMs + 300
+        val target = skipTargetMs(seg)
         val est = posMs + (SystemClock.elapsedRealtime() - posAt)
         if (!dragBarTo(est, target)) return
         lastSeekAt = SystemClock.elapsedRealtime()
