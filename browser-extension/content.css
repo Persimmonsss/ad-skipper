@@ -1,0 +1,39 @@
+.adskipper-bubble {
+  position: fixed;
+  left: 50%;
+  bottom: 120px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 11px 21px;
+  border-radius: 999px;
+  background: rgba(33, 33, 33, 0.9);
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  color: #fff;
+  font-size: 15px;
+  line-height: 1.4;
+  font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  z-index: 2147483647;
+  /* 倒计时提示不能挡住播放器：整块不吃点击，只有撤回按钮可点 */
+  pointer-events: none;
+}
+
+.adskipper-bubble[hidden] {
+  display: none;
+}
+
+.adskipper-bubble button {
+  pointer-events: auto;
+  border: 0;
+  background: transparent;
+  color: #ffd54f;
+  font-size: 15px;
+  font-weight: 600;
+  padding: 0;
+  cursor: pointer;
+}
+
+.adskipper-bubble button:hover {
+  text-decoration: underline;
+}

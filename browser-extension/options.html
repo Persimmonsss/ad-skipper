@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>广告跳过 · B站内嵌广告</title>
+<style>
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; background:#f6f7f8; color:#212121; margin:0; padding:28px 24px 48px; }
+  .card { max-width: 620px; margin: 0 auto 16px; background:#fff; border-radius:12px; padding:20px 22px; box-shadow:0 1px 3px rgba(0,0,0,.08); }
+  h1 { font-size:19px; margin:0 0 4px; }
+  .sub { color:#8a8f99; font-size:13px; margin:0; }
+  .row { display:flex; align-items:center; justify-content:space-between; padding:12px 0; border-top:1px solid #f0f1f3; }
+  .row:first-of-type { border-top:0; }
+  .row p { margin:0; font-size:14px; }
+  .row small { display:block; color:#8a8f99; font-size:12px; margin-top:2px; }
+  .stats { font-size:14px; line-height:1.9; }
+  .stats b { color:#fb7299; }
+  button { background:#fb7299; color:#fff; border:0; border-radius:8px; padding:8px 14px; font-size:13px; cursor:pointer; }
+  button.ghost { background:#eceef1; color:#444; }
+  #probe_out { white-space:pre-wrap; word-break:break-all; font-size:12px; color:#555; margin-top:10px; min-height:18px; }
+  input[type=checkbox] { width:18px; height:18px; accent-color:#fb7299; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>B 站内嵌广告跳过</h1>
+    <p class="sub">数据源：BilibiliSponsorBlock 社区标注（三镜像自动兜底）· 只取 sponsor 分类</p>
+    <div class="row">
+      <p>自动跳过<small>关掉后只显示提示，不再跳转进度</small></p>
+      <input type="checkbox" id="sw_enabled">
+    </div>
+    <div class="row">
+      <p>跳过前 3 秒提示<small>撤回按钮不受此项影响</small></p>
+      <input type="checkbox" id="sw_bubble">
+    </div>
+  </div>
+
+  <div class="card">
+    <h1 style="font-size:16px">统计</h1>
+    <div class="stats" id="stats">读取中…</div>
+    <div class="row" style="border-top:0">
+      <p style="color:#8a8f99">计数存在本机，重装浏览器会清零</p>
+      <button class="ghost" id="btn_reset">清零</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h1 style="font-size:16px">数据源自检</h1>
+    <div class="row">
+      <p>输入 BV 号看社区库里有没有标注<small>用于判断「没跳」是插件问题还是这条视频本来没人标</small></p>
+      <div>
+        <input type="text" id="probe_bvid" value="BV1njnn6yEMY" style="width:150px;padding:7px 9px;border:1px solid #dcdfe3;border-radius:8px;font-size:13px">
+        <button id="btn_probe">查询</button>
+      </div>
+    </div>
+    <div id="probe_out"></div>
+  </div>
+
+  <script src="options.js"></script>
+</body>
+</html>

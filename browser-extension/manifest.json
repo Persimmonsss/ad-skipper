@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "广告跳过 · B站内嵌广告",
+  "version": "0.1.0",
+  "version_name": "0.1.0",
+  "description": "按社区标注跳过 B 站视频内嵌的恰饭片段，跳过后 3 秒内可撤回。与 ad-skipper App 同一套数据源与落点规则。",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "https://bsbsb.top/*",
+    "https://bsbsb.cc/*",
+    "https://www.bsbsb.xyz/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "广告跳过 · 设置与统计"
+  },
+  "options_page": "options.html",
+  "content_scripts": [
+    {
+      "matches": ["https://www.bilibili.com/video/*"],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://www.bilibili.com/video/*"],
+      "js": ["main-world.js"],
+      "world": "MAIN",
+      "run_at": "document_start"
+    }
+  ]
+}

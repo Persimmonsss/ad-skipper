@@ -1,6 +1,6 @@
 # ad-skipper
 
-Android 免 root 广告跳过工具（无障碍服务实现）。当前版本 v2.1.2。
+Android 免 root 广告跳过工具（无障碍服务实现）。当前版本 v2.1.2，另附 B 站内嵌广告的浏览器插件（见「浏览器插件」一节）。
 
 ## 已有模块
 
@@ -159,6 +159,54 @@ Android 免 root 广告跳过工具（无障碍服务实现）。当前版本 v2
 - 模拟器（MuMu）上红果不投剧内广告，红果分支只能在真机验收
 
 
+## 浏览器插件（B 站内嵌广告，v1 实测通过）
+
+`browser-extension/`，Chrome / Edge 的 MV3 扩展，只作用于 `www.bilibili.com/video/*`。
+方案和 App 侧一致：同一串镜像（`bsbsb.top → bsbsb.cc → www.bsbsb.xyz`）、只认 `sponsor` 分类、
+提前 3 秒倒计时、直接 seek 到段尾、3 秒内可点「撤回」回到广告前 2 秒、落点同样钳在片尾前 1.5 秒。
+
+与 App 不同的三处（都是平台差异逼出来的，不是另起一套）：
+
+- 浏览器里能直接读 `video.currentTime`，所以 App 那套「进度文本正则 + 时间外推 + 唤控件 + 拖进度条」
+  兜底全部不需要；但内容脚本的 `setInterval` 在后台标签会被降频到 1 分钟一次（实测跳过晚了 4 分钟），
+  所以主循环挂在 `timeupdate / seeked / play / pause / durationchange` 媒体事件上（约 4 次/秒，不受降频），
+  250ms 定时器只做补充
+- 取片段必须放 service worker：内容脚本跟页面吃 CORS，镜像不给 bilibili.com 发跨域头
+- BV / cid 识别：`__INITIAL_STATE__` 在 MAIN world，内容脚本（isolated world）读不到，
+  所以另有一条 `"world": "MAIN"` 的脚本把 `{bvid, cid}` 写进 `documentElement.dataset` 跨世界共享。
+  **多 P 页面里 `videoData.cid` 恒等于第一 P**（实测 `?p=3` 时它还是 P1 的 cid），
+  必须按 URL 的 `?p=` 去 `pages[]` 取当前 P，否则会拿别的分 P 的标注来跳
+- 缓存按 BV 存、不分 cid（6 小时 TTL），切分 P 在本地过滤，省一次网络请求；
+  404 与「200 + 空数组」都计为未命中
+- 气泡整层 `pointer-events:none`，只有「撤回」按钮可点，不吃页面上的正常点击；
+  全屏时挂进 `document.fullscreenElement` 子树（挂 `body` 的话全屏里看不见）
+- 点工具栏图标是开关页：自动跳过 / 提前 3 秒提示两个开关、跳过与撤回计数、角标显示累计跳过次数，
+  外加「数据源自检」——输入 BV 号直接看社区库里到底有没有标注，用来区分「插件坏了」和「这条没人标」
+
+装机（未上扩展商店，只能开发者模式加载）：
+
+1. 把 `browser-extension/` 放到**纯 ASCII 路径**（工程根目录带中文时先复制出去）；
+2. Edge 开 `edge://extensions`、Chrome 开 `chrome://extensions`，打开「开发人员模式」；
+3. 「加载未打包的扩展」→ 选 `browser-extension` 目录；
+4. 打开任意 B 站视频页即生效，无需登录、无需其它权限。
+
+自动化验收踩坑（写给下次）：Chrome 156 稳定版已经**忽略** `--load-extension`（headless 与 headed
+都只加载内置扩展，profile 里 `extensions.settings` 为 0 条）；Edge 156 还认，但只在**全新
+user-data-dir** 时生效，复用旧 profile 会静默不注入。
+
+实测（Edge 156.0.4314.50 真装扩展 + CDP 驱动，只 evaluate 不动键鼠，7 组 48 条断言全绿）：
+
+- 主链路 12/12：BV1e1HA6RE1u 跳过落点误差 0.33 秒、撤回误差 0.55 秒；BV1njnn6yEMY 两项误差 0.00 秒；
+  撤回后 6 秒内不二次跳、倒计时层不吃点击
+- 片尾边界 BV1imaN6tEK3 5/5：落点剩 1.50 秒不越界，播完由 B站 自动连播下一条，没有把同一视频拉回 00:00
+- 全屏 6/6、总开关 4/4（关掉后 11 秒播过广告段不跳）、多 P cid 3/3、无标注 3/3、后台单测 4/4、开关页 11/11
+- 数据源自检实测输出：已标注「命中 1 段（来自 https://bsbsb.cc）06:13–07:56 cid=42869984501」，
+  未标注「社区库里这条没有 sponsor 标注（https://bsbsb.cc 返回 404）」
+
+已知限制（不是 bug）：只对社区库已标注的视频生效；只接了 `sponsor` 分类，B站 网页贴片、
+充电/恰饭片头不在范围；标签页在后台时 B站 自己会暂停播放，暂停不跳是预期行为；只能开发者模式加载。
+
+
 ## 构建
 
 ```bash
@@ -171,6 +219,6 @@ Android 免 root 广告跳过工具（无障碍服务实现）。当前版本 v2
 ## Roadmap
 
 - [ ] 抖音等其它短视频平台
-- [ ] 浏览器插件
+- [x] 浏览器插件（B 站内嵌广告：跳过 + 3 秒撤回，Chrome/Edge MV3，未上商店）
 - [x] B 站时间轴内嵌广告跳过
 - [x] 开屏广告启发式跳过
