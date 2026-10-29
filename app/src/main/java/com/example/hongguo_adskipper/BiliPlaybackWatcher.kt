@@ -43,6 +43,7 @@ class BiliPlaybackWatcher : NotificationListenerService() {
     private val io = Executors.newSingleThreadExecutor()
 
     private var controller: MediaController? = null
+    private var sessMgr: MediaSessionManager? = null
     private var currentTitle: String? = null
     private var resolving = false
     private var pendingResolve: Pair<String, String?>? = null
@@ -78,6 +79,7 @@ class BiliPlaybackWatcher : NotificationListenerService() {
         connected = true
         Stats.log("B站监听已连接")
         val mgr = getSystemService(MediaSessionManager::class.java) ?: return
+        sessMgr = mgr
         val comp = ComponentName(this, BiliPlaybackWatcher::class.java)
         runCatching { mgr.addOnActiveSessionsChangedListener(listener, comp) }
             .onFailure { Stats.log("会话监听失败：${it.message}") }
@@ -92,6 +94,9 @@ class BiliPlaybackWatcher : NotificationListenerService() {
     }
 
     override fun onDestroy() {
+        // 不摘掉的话服务销毁后监听还在 MediaSessionManager 上，回调会继续 post 到主线程
+        sessMgr?.let { runCatching { it.removeOnActiveSessionsChangedListener(listener) } }
+        sessMgr = null
         releaseController()
         io.shutdownNow()
         if (instance === this) instance = null

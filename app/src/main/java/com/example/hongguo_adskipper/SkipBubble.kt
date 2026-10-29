@@ -4,7 +4,7 @@ import android.content.Context
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
-import android.provider.Settings
+import android.provider.Settings as AndroidSettings
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
@@ -67,7 +67,7 @@ class SkipBubble(private val context: Context) {
     fun show(text: String) = show(text, null, null)
 
     fun show(text: String, actionText: String?, onAction: (() -> Unit)?) {
-        if (!Settings.canDrawOverlays(context)) return
+        if (!AndroidSettings.canDrawOverlays(context)) return
         if (container == null) build()
         val key = "$text|$actionText"
         if (key != lastKey) {
