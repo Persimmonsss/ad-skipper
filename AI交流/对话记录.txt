@@ -1300,3 +1300,35 @@ D2 在最终包上 PASS。再补「息屏 0 扫描」这条红线：让 B站 在
 【助手 21:42】
 进度只同步了一部分（协作板回写 + 看板状态），交付声明和三个存疑项结论还没落进 `AI交流/`。现在补齐。
 
+
+【助手 23:30 · 浏览器插件（T12）交付】
+用户新需求：「把 B 站跳广告整成浏览器插件，方案最好差不多，然后直接在浏览器里测」。
+已确认口径：Chrome/Edge（MV3）；第一版只做 B 站内嵌广告（跳过 + 3 秒撤回）；验收 = 注入实测 + 独立浏览器真装。
+
+产出：`browser-extension/`（manifest / background service worker / content / main-world / content.css / options），
+README 新增「浏览器插件」一节 + Roadmap 勾选，本目录新增 `T12_浏览器插件.md`，看板加 T12 行（已交付）。
+
+方案对齐：同一串镜像、只认 sponsor、3 秒倒计时、seek 到段尾、落点钳 `dur−1500ms`、3 秒撤回回 `start−2000ms`、
+撤回后该段留 skipped。三处按平台改写：跨域取数据放 service worker；主循环挂媒体事件（后台标签 setInterval
+被降频到 1 分钟一次，实测跳过晚 4 分钟）；`__INITIAL_STATE__` 在 MAIN world，用 dataset 桥接给 isolated world。
+
+过程中抓出的真 bug（都已修 + 复验）：
+1. 后台降频导致跳过晚 4 分钟 → 改媒体事件驱动 + `pending.dueAt` 校验；
+2. 多 P 页面 `videoData.cid` 恒等于第一 P（`?p=3` 实测仍是 P1）→ 改按 URL `?p=` 取 `pages[p-1].cid`；
+3. 撤回气泡点不到 → `tick` 里撤回窗口判定必须早于「暂停/拖动中不跳」，否则刚弹出来就被当场收掉；
+4. 全屏看不到气泡 → 挂到 `document.fullscreenElement` 子树；
+5. 缓存原先按 cid 过滤后存盘（切 P 会永久丢数据）→ 存全量、返回时再过滤。
+
+实测（Edge 156.0.4314.50 真装扩展 + CDP，只 evaluate 不动键鼠）：7 组 48 条断言全绿。
+主链路随机抽到 BV1e1HA6RE1u：跳过误差 0.33s、撤回误差 0.55s、撤回后 6s 不二次跳；
+BV1njnn6yEMY 两项误差 0.00s；边界 BV1imaN6tEK3 落点剩 1.50s 且播完由 B站 自动连播（不是重播）；
+全屏 6/6、开关 4/4、多 P 3/3、无标注 3/3、SW 单测 4/4、options 11/11。
+
+一条假 FAIL 记录：boundary 曾报「t=2.1 从 0 重播」，取证发现是 B站 自动连播到 BV14JpC6ZE3U（href 变了、
+dur=1925），断言只看 t 没看 BV → 改成「同一 BV 同 dur 才算重播」。
+
+环境结论（下次别重踩）：Chrome 156 稳定版已忽略 `--load-extension`（headless/headed 都只加载内置扩展）；
+Edge 156 认，但只在全新 user-data-dir 生效，复用旧 profile 会静默不注入。Qoder 内置浏览器是 webview，装不了扩展。
+
+未 push。仍等用户点头：① 是否推 origin/main（推之前要脱敏 `AI交流/` 里的内网 adb 地址与设备序列号）；
+② T9（E4 同标题切集沿用上一集片段库）是否并入下一版。
