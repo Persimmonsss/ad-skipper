@@ -33,15 +33,14 @@ object BiliSegmentRepo {
         }
         Stats.log("搜索命中 ${candidates.size} 条候选")
         // 优先取社区库里有 sponsor 片段的候选，避免同名视频误匹配
-        for ((aid, _) in candidates.take(3)) {
-            val bvid = AvBv.av2bv(aid)
+        for ((bvid, _) in candidates.take(3)) {
             val segs = fetchSegments(bvid)
             if (segs.isNotEmpty()) {
                 titleCache[key] = bvid
                 return bvid
             }
         }
-        val fallback = candidates.first().let { AvBv.av2bv(it.first) }
+        val fallback = candidates.first().first
         Stats.log("社区库无片段：$fallback")
         titleCache[key] = fallback
         return fallback
@@ -49,41 +48,59 @@ object BiliSegmentRepo {
 
     /**
      * 整句标题（带标点、很长）拿去搜索，B站 常返回一堆相似但不相干的视频；
-     * 用第一个分句当关键词，召回结果里再做相似度匹配。
+     * 但只给首句又会漏掉目标（实测“一只小胡蜂钻进飞机”召不回原片，加上第二分句才命中），
+     * 所以按“前两个分句 → 首句 → 整句”依次试，命中即停。
      */
-    private fun searchKeyword(title: String): String {
-        val head = title.split('，', ',', '。', '！', '？', ' ', '|', '｜', '：', ':')
-            .firstOrNull { it.isNotBlank() }?.trim().orEmpty()
-        return (if (head.length >= 4) head else title).take(24)
+    private fun searchKeywords(title: String): List<String> {
+        val clauses = title.split('，', ',', '。', '！', '？', ' ', '|', '｜', '：', ':')
+            .filter { it.isNotBlank() }
+        val out = LinkedHashSet<String>()
+        if (clauses.size >= 2) out.add((clauses[0] + clauses[1]).take(24))
+        clauses.firstOrNull()?.let { out.add(it) }
+        out.add(title.take(24))
+        return out.filter { it.isNotBlank() }
     }
 
-    /** 返回 aid + 时长秒数 */
-    private fun searchCandidates(title: String): List<Pair<Long, Int>> {
-        val keyword = searchKeyword(title)
-        val url = "https://app.bilibili.com/x/v2/search?keyword=${URLEncoder.encode(keyword, "UTF-8")}&build=7000300"
-        val body = httpGet(url) ?: return emptyList()
+    /** 返回 BV 号 + 时长秒数 */
+    private fun searchCandidates(title: String): List<Pair<String, Int>> {
+        for (keyword in searchKeywords(title)) {
+            val hit = searchOnce(title, keyword)
+            if (hit.isNotEmpty()) return hit
+        }
+        return emptyList()
+    }
+
+    private fun searchOnce(title: String, keyword: String): List<Pair<String, Int>> {
+        // app 端 x/v2/search 会忽略关键词返回推荐流（实测全是无关内容），改用 web 搜索接口
+        val url = "https://api.bilibili.com/x/web-interface/search/all/v2?keyword=${URLEncoder.encode(keyword, "UTF-8")}"
+        val body = httpGet(url, referer = "https://www.bilibili.com/") ?: return emptyList()
         return try {
             val root = JSONObject(body)
-            val items = root.optJSONObject("data")?.optJSONArray("item") ?: JSONArray()
+            val groups = root.optJSONObject("data")?.optJSONArray("result") ?: JSONArray()
+            val items = JSONArray()
+            for (i in 0 until groups.length()) {
+                val g = groups.optJSONObject(i) ?: continue
+                if (g.optString("result_type") != "video") continue
+                val arr = g.optJSONArray("data") ?: continue
+                for (j in 0 until arr.length()) items.put(arr.optJSONObject(j) ?: continue)
+            }
             Stats.log("搜索返回 ${items.length()} 条（code=${root.optInt("code")}）")
             val want = normalize(title)
-            // aid / 时长 / 相似度；标题可能被加尾注或标点差异，不能只认完全相等
-            val scored = mutableListOf<Triple<Long, Int, Int>>()
+            // 时长 / 相似度；标题可能被加尾注或标点差异，不能只认完全相等
+            val scored = mutableListOf<Triple<String, Int, Int>>()
             var firstTitle = ""
             for (i in 0 until items.length()) {
                 val item = items.optJSONObject(i) ?: continue
                 val t = normalize(stripTags(item.optString("title")))
                 if (i == 0) firstTitle = t
-                val aid = item.optString("param").toLongOrNull()
-                    ?: item.optLong("aid", 0L).takeIf { it > 0 }
-                    ?: continue
+                val bvid = item.optString("bvid").takeIf { it.startsWith("BV") } ?: continue
                 val dur = parseDuration(item.optString("duration"))
                 val score = when {
                     t == want -> 1000
                     t.contains(want) || want.contains(t) -> 500 + minOf(t.length, want.length)
                     else -> commonPrefix(t, want)
                 }
-                if (score >= 8 && durationCompatible(dur)) scored.add(Triple(aid, dur, score))
+                if (score >= 8 && durationCompatible(dur)) scored.add(Triple(bvid, dur, score))
             }
             scored.sortByDescending { it.third }
             if (scored.isEmpty() && firstTitle.isNotEmpty()) {
@@ -136,7 +153,7 @@ object BiliSegmentRepo {
         return emptyList()
     }
 
-    private fun httpGet(url: String): String? {
+    private fun httpGet(url: String, referer: String? = null): String? {
         var conn: HttpURLConnection? = null
         return try {
             conn = (URL(url).openConnection() as HttpURLConnection).apply {
@@ -144,6 +161,7 @@ object BiliSegmentRepo {
                 readTimeout = 8000
                 setRequestProperty("User-Agent", UA)
                 setRequestProperty("Accept", "application/json")
+                if (referer != null) setRequestProperty("Referer", referer)
             }
             if (conn.responseCode != 200) {
                 Stats.log("HTTP ${conn.responseCode} ${url.take(48)}")
