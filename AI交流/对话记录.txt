@@ -703,7 +703,7 @@ B站 被直接启动到了新用户生日引导页（adb 直接拉 MainActivityV
 - 文件：D:\Life\WeChatFile\xwechat_files\wxid_m22q8pdle02222_6e06\temp\RWTemp\2026-10\7ccdf2df20a5cf004c0eeca48d82be11\23ad01ab6795f9a743fcabd84b6d0b69.jpg
 
 【助手 10-29 14:19】
-网络是通的：电脑 <内网 adb 地址·已脱敏>，手机 <内网 adb 地址·已脱敏> 能 ping 到；但直连 42663 失败，说明需要先配对。
+网络是通的：电脑与手机同网段、能互 ping（IP 已脱敏）；但直连 42663 失败，说明需要先配对。
 
 你现在点「使用配对码配对设备」，屏幕会显示：
 - 一个 **IP:端口**（这个端口和 42663 不一样，是配对端口）
