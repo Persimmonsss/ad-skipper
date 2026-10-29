@@ -29,6 +29,7 @@ class BiliUiSkip(
         private const val MAX_SCAN_NODES = 600
         private const val UNDO_MS = 3000L
         private const val UNDO_BACK_MS = 2000L
+        private const val THUMB_RADIUS_DP = 8f
         private val PROGRESS = Regex("""(\d{1,2}):(\d{2})(?::(\d{2}))?\s*/\s*(\d{1,2}):(\d{2})(?::(\d{2}))?""")
     }
 
@@ -43,10 +44,10 @@ class BiliUiSkip(
     private var pendingSeg: AdSegment? = null
     private var pendingTarget = 0L
     private var pendingBeforePos: Long? = null
-    private var revealedFor: String? = null
     private var lastBvid: String? = null
     private var lastPosLog = 0L
     private var lastStateLog = 0L
+    private var lastBarLog = ""
     private var lastBootstrap = 0L
     private var paused: Boolean? = null
     private var undoUntil = 0L
@@ -73,8 +74,15 @@ class BiliUiSkip(
             bubble.hide()
             return
         }
-        if (paused == true) return
         val now = SystemClock.elapsedRealtime()
+        // 暂停时 B站 也会自动隐藏控件，读数会陈旧；陈旧了就先重读一次再判断
+        if (paused == true) {
+            if (now - posAt > 5000 && now - lastBootstrap > 8000) {
+                lastBootstrap = now
+                reanchor()
+            }
+            return
+        }
         if (now < undoUntil) return
         resetIfVideoChanged()
         val segs = Stats.biliSegList
@@ -82,24 +90,44 @@ class BiliUiSkip(
         if (posMs < 0) {
             if (now - lastBootstrap > 15_000) {
                 lastBootstrap = now
-                revealControls()
+                reanchor()
             }
             return
         }
         val est = posMs + (now - posAt)
-        val seg = segs.firstOrNull { est >= it.startMs - REVEAL_LEAD_MS && est < it.endMs } ?: return
+        val seg = segs.firstOrNull { est >= it.startMs - REVEAL_LEAD_MS && est < it.endMs }
+        if (seg == null) {
+            // 暂停/拖动过会让外推值漂移，广告段附近定期重新读一次真实位置
+            val near = segs.any {
+                !skipped.contains(it.uuid) && est >= it.startMs - 60_000 && est <= it.endMs + 60_000
+            }
+            if (near && bar == null && now - lastBootstrap > 8000) {
+                lastBootstrap = now
+                reanchor()
+            }
+            return
+        }
         if (est < seg.startMs && now - lastStateLog > 4000) {
             lastStateLog = now
             Stats.log("临近广告 ${fmt(est)} 控件${if (bar == null) "隐藏" else "可见"}")
         }
         if (est < seg.startMs - LEAD_MS) {
-            if (bar == null && revealedFor != seg.uuid) {
-                revealedFor = seg.uuid
-                revealControls()
+            if (bar == null && now - lastBootstrap > 6000) {
+                lastBootstrap = now
+                reanchor()
             }
             return
         }
         apply(now)
+    }
+
+    /** 唤出控件并主动扫一次，把外推位置纠回真实读数。 */
+    private fun reanchor() {
+        revealControls()
+        main.postDelayed({
+            lastScan = 0
+            scanInto(service.rootInActiveWindow)
+        }, 600)
     }
 
     private fun resetIfVideoChanged() {
@@ -109,7 +137,6 @@ class BiliUiSkip(
             skipped.clear()
             attempts.clear()
             pendingSeg = null
-            revealedFor = null
             bar = null
             undoUuid = null
             undoUntil = 0
@@ -127,6 +154,11 @@ class BiliUiSkip(
             if (scan.dur > 0) durMs = scan.dur
             Stats.biliPositionMs = posMs
             if (durMs > 0) Stats.biliDurationMs = durMs
+            val b = scan.bar
+            if (b != null && lastBarLog != "${b.left},${b.top},${b.width()}x${b.height()}") {
+                lastBarLog = "${b.left},${b.top},${b.width()}x${b.height()}"
+                Stats.log("进度条 $lastBarLog")
+            }
             if (Stats.biliSegList.isNotEmpty() && posAt - lastPosLog > 10_000) {
                 lastPosLog = posAt
                 Stats.log("进度 ${fmt(posMs)} / ${fmt(durMs)}")
@@ -134,6 +166,9 @@ class BiliUiSkip(
         }
         if (scan.bar != null) {
             bar = scan.bar
+            if (scan.paused != null && paused != null && scan.paused != paused) {
+                Stats.log(if (scan.paused) "检测到暂停，暂不跳过" else "恢复播放")
+            }
             paused = scan.paused
         } else {
             bar = null
@@ -219,17 +254,27 @@ class BiliUiSkip(
                 if (ok != null) {
                     finishSkip(seg, ok)
                 } else {
-                    pendingSeg = null
-                    skipped.remove(seg.uuid)
                     Stats.log("会话 seek 无效，改用拖动")
-                    dragPath(seg)
+                    retryDrag(seg)
                 }
             }, 900)
             return
         }
+        Stats.log("会话 seek 无效（${fmt(posMs)}），改用拖动")
+        retryDrag(seg)
+    }
+
+    /** 拖动失败会回到这里，必须限次数，否则一直原地重试。 */
+    private fun retryDrag(seg: AdSegment) {
         pendingSeg = null
         skipped.remove(seg.uuid)
-        Stats.log("会话 seek 无效（${fmt(posMs)}），改用拖动")
+        val tries = attempts[seg.uuid] ?: 0
+        if (tries >= 3) {
+            skipped.add(seg.uuid)
+            Stats.log("多次跳转未生效，放弃该片段")
+            return
+        }
+        attempts[seg.uuid] = tries + 1
         dragPath(seg)
     }
 
@@ -403,8 +448,13 @@ class BiliUiSkip(
         val dur = durMs
         if (dur <= 0 || posMs < 0) return false
         val y = r.exactCenterY()
-        val fromX = (r.left + (fromMs.toFloat() / dur) * r.width()).coerceIn(r.left + 2f, r.right - 2f)
-        val toX = (r.left + (toMs.toFloat() / dur) * r.width()).coerceIn(r.left + 2f, r.right - 2f)
+        // 拖动必须从滑块中心起手，B站 才认；直接用 left+比例 会落在轨道上被忽略
+        val thumb = THUMB_RADIUS_DP * service.resources.displayMetrics.density
+        val usable = (r.width() - 2 * thumb).coerceAtLeast(1f)
+        fun xOf(ms: Long) = (r.left + thumb + (ms.toFloat() / dur) * usable)
+            .coerceIn(r.left + 1f, r.right - 1f)
+        val fromX = xOf(fromMs)
+        val toX = xOf(toMs)
         val path = Path().apply {
             moveTo(fromX, y)
             lineTo(toX, y)
@@ -455,9 +505,12 @@ class BiliUiSkip(
                 n.getBoundsInScreen(r)
                 if (r.width() > 400 && r.height() in 6..240) barRect = r
             }
-            if (isPaused == null && id != null && id.contains("_play", true)) {
-                val d = n.contentDescription?.toString().orEmpty()
-                if (d.contains("播放") || d.contains("暂停")) isPaused = d.contains("播放")
+            // 页面里“49.2万播放”这类文案也含“播放”，只认播放器按钮的精确描述
+            if (isPaused == null && id != null && id.contains("play", true)) {
+                when (n.contentDescription?.toString()?.trim()) {
+                    "播放" -> isPaused = true
+                    "暂停" -> isPaused = false
+                }
             }
             for (i in 0 until n.childCount) {
                 val child = n.getChild(i) ?: continue
