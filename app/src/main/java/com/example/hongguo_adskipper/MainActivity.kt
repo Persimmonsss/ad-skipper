@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.provider.Settings as AndroidSettings
 import android.widget.Button
 import android.widget.TextView
@@ -24,6 +25,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvA11y: TextView
     private lateinit var tvNls: TextView
     private lateinit var tvOverlay: TextView
+    private lateinit var tvBattery: TextView
     private lateinit var swBili: MaterialSwitch
     private lateinit var swBubble: MaterialSwitch
     private lateinit var swSplash: MaterialSwitch
@@ -47,6 +49,7 @@ class MainActivity : AppCompatActivity() {
         tvA11y = findViewById(R.id.tv_a11y_status)
         tvNls = findViewById(R.id.tv_nls_status)
         tvOverlay = findViewById(R.id.tv_overlay_status)
+        tvBattery = findViewById(R.id.tv_battery_status)
         swBili = findViewById(R.id.sw_bili)
         swBubble = findViewById(R.id.sw_bubble)
         swSplash = findViewById(R.id.sw_splash)
@@ -54,7 +57,7 @@ class MainActivity : AppCompatActivity() {
         tvBiliState = findViewById(R.id.tv_bili_state)
         tvStats = findViewById(R.id.tv_stats)
         tvLog = findViewById(R.id.tv_log)
-        findViewById<TextView>(R.id.tv_version).text = "v2.1.1"
+        findViewById<TextView>(R.id.tv_version).text = versionLabel()
 
         bindSwitch(swBili) { Settings.biliEnabled = it }
         bindSwitch(swBubble) { Settings.bubbleEnabled = it }
@@ -72,6 +75,7 @@ class MainActivity : AppCompatActivity() {
                 Intent(AndroidSettings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
             )
         }
+        findViewById<MaterialButton>(R.id.btn_battery).setOnClickListener { requestIgnoreBattery() }
         findViewById<Button>(R.id.btn_clear_log).setOnClickListener { Stats.clearLogs() }
         findViewById<MaterialButton>(R.id.btn_open_bili).setOnClickListener {
             openPackage("tv.danmaku.bili", "未安装 B站")
@@ -113,6 +117,9 @@ class MainActivity : AppCompatActivity() {
         tvA11y.text = if (a11y) "无障碍服务：已开启" else "无障碍服务：未开启（开屏/红果需要）"
         tvNls.text = if (nls) "通知使用权：已开启" else "通知使用权：未开启（B站跳过需要）"
         tvOverlay.text = if (overlay) "悬浮窗：已开启" else "悬浮窗：未开启（气泡提示需要）"
+        val battery = isIgnoringBattery()
+        tvBattery.text = if (battery) "电池优化：已加白名单（后台不会被冻结）"
+            else "电池优化：未加白名单（MIUI 会冻结后台，服务可能自己掉线）"
 
         swBili.isChecked = Settings.biliEnabled
         swBubble.isChecked = Settings.bubbleEnabled
@@ -136,7 +143,8 @@ class MainActivity : AppCompatActivity() {
                 if (dur > 0) append(" / ").append(fmt(dur))
             }
         }
-        tvStats.text = "B站跳过 ${Stats.biliSkipCount} 次（最近 ${Stats.biliLastSkip}） · 开屏点击 ${Stats.splashClickCount} 次" +
+        tvStats.text = "B站跳过 ${Stats.biliSkipCount} 次 · 撤回 ${Stats.biliUndoCount} 次（最近 ${Stats.biliLastSkip}）" +
+            " · 开屏点击 ${Stats.splashClickCount} 次" +
             "\n红果检测 ${AdSkipAccessibilityService.adDetectedCount} 次" +
             " · 滑动 ${AdSkipAccessibilityService.adSkipCount} 次" +
             " · 成功 ${AdSkipAccessibilityService.adSkipSuccessCount} 次" +
@@ -181,6 +189,40 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+
+    /** 版本号只有一个来源：安装包自身。布局与代码里再硬编码一次必然漏改。 */
+    private fun versionLabel(): String {
+        val name = try {
+            packageManager.getPackageInfo(packageName, 0).versionName
+        } catch (e: Exception) {
+            null
+        }
+        return if (name.isNullOrEmpty()) "版本未知" else "v$name"
+    }
+
+    private fun isIgnoringBattery(): Boolean = try {
+        getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
+    } catch (e: Exception) {
+        true
+    }
+
+    /**
+     * 请求加入电池优化白名单。MIUI 不设这个白名单会把后台服务冻结，
+     * 实测通知监听与无障碍服务都掉过线；直连弹窗不可用时退回系统列表页。
+     */
+    private fun requestIgnoreBattery() {
+        try {
+            startActivity(
+                Intent(
+                    AndroidSettings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    Uri.parse("package:$packageName")
+                )
+            )
+        } catch (e: Exception) {
+            // 部分 ROM 没有直连弹窗，退回系统列表页
+            startActivitySafe(Intent(AndroidSettings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+        }
+    }
 
     private fun requestNotificationPermission() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
