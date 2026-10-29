@@ -28,7 +28,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
         private const val TAG = "AdSkipService"
         private const val CHANNEL_ID = "ad_skip_channel"
         private const val NOTIFICATION_ID = 1
-        const val VERSION = "v1.3.0"
+        const val VERSION = "v2.1.1"
 
         private val TARGET_PACKAGES = listOf(
             "com.phoenix.read",
@@ -72,7 +72,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
         private const val SPLASH_MAX_CLICKS = 2
         private val SKIP_LABEL = Regex("""(?i)^(跳过|跳過|关闭|關閉|skip|close)(广告|廣告)?(\s*\d+\s*[s秒]?)?$""")
         private const val SPLASH_SKIP_PKGS =
-            "com.android.systemui,com.android.launcher,com.android.settings,com.phoenix.read"
+            "com.android.systemui,com.android.launcher,com.android.settings,com.phoenix.read," +
+                    "com.miui.home,com.miui.personalassistant"
 
         // ========== 统计数据 ==========
         var isServiceEnabled = false
@@ -649,6 +650,9 @@ class AdSkipAccessibilityService : AccessibilityService() {
 
     private fun scanSplashOnce(now: Long) {
         val pkg = splashPkg ?: return
+        // 输入法、小窗弹出也会算“应用切换”，此时开屏 App 已不在前台，
+        // 继续按坐标盲点会点到当前页面（实测点掉过 B站 的“取消”）
+        if (activeWindowPackage() != pkg) return
         if (splashClickCount >= SPLASH_MAX_CLICKS) return
         if (now - lastSplashClick < SPLASH_CLICK_CD_MS) return
         if (now - lastSplashScan < SPLASH_SCAN_STEP_MS) return
