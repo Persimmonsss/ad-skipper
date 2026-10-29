@@ -49,6 +49,9 @@ class BiliUiSkip(
     private var lastStateLog = 0L
     private var lastBarLog = ""
     private var lastBootstrap = 0L
+    private var lastPassiveScan = 0L
+    private var pausedReanchors = 0
+
     private var paused: Boolean? = null
     private var undoUntil = 0L
     private var undoTo = 0L
@@ -78,15 +81,26 @@ class BiliUiSkip(
         // 暂停时 B站 也会自动隐藏控件，读数会陈旧；但只有停在广告段附近才值得点一下屏幕
         // 重读，否则用户暂停看评论时会被我们反复唤出控件
         if (paused == true) {
+            // 暂停期间必须冻住外推：不然用户停十分钟，est 就永远越过广告段，恢复播放后
+            // 这一整场都不会再跳
+            posAt = now
             val near = Stats.biliSegList.any {
                 !skipped.contains(it.uuid) && posMs in (it.startMs - 90_000)..it.endMs
             }
-            if (near && now - posAt > 5000 && now - lastBootstrap > 8000) {
+            if (near && pausedReanchors < 3 && now - lastBootstrap > 8000) {
+                // 停在广告前不动时最多戳 3 次，之后交给静默重扫，不和人抢屏幕
+                pausedReanchors++
                 lastBootstrap = now
                 reanchor()
+            } else if (now - lastPassiveScan > 5000) {
+                // 控件隐藏时详情页几乎没有无障碍事件，没人扫节点的话 paused 会一直停在
+                // true，用户恢复播放也救不回来；这里每 5 秒静默重扫一次（不点屏）
+                lastPassiveScan = now
+                scanInto(service.rootInActiveWindow)
             }
             return
         }
+        pausedReanchors = 0
         if (now < undoUntil) return
         resetIfVideoChanged()
         val segs = Stats.biliSegList
