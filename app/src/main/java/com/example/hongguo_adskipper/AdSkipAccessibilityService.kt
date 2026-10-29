@@ -404,12 +404,15 @@ class AdSkipAccessibilityService : AccessibilityService() {
 
             sendStatsBroadcast()
             handler.postDelayed({
-                performSwipeUp()
-                logDebug("已执行滑动 第${consecutiveSwipes}次")
-                // 延迟后再检查一次，判断是否成功跳过
-                handler.postDelayed({
-                    checkSwipeResult()
-                }, 2000)
+                if (performSwipeUp()) {
+                    logDebug("已执行滑动 第${consecutiveSwipes}次")
+                    // 延迟后再检查一次，判断是否成功跳过
+                    handler.postDelayed({
+                        checkSwipeResult()
+                    }, 2000)
+                } else {
+                    logDebug("滑动未执行：红果已不在前台")
+                }
             }, AD_WAIT_MS)
         } else {
             // 当前不是广告，检查上一次滑动是否成功
@@ -430,6 +433,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
      * 检查滑动结果
      */
     private fun checkSwipeResult() {
+        // 滑动 + 复核一共延了 3.5 秒，用户可能已经按了电源；息屏时读节点既没意义也费电
+        if (!screenOn()) return
         val rootNode = activeWindowRoot() ?: return
         val packageName = rootNode.packageName?.toString() ?: return
         if (!TARGET_PACKAGES.contains(packageName)) return
@@ -584,7 +589,10 @@ class AdSkipAccessibilityService : AccessibilityService() {
 
     // ==================== 滑动 ====================
 
-    private fun performSwipeUp() {
+    /** 手势是全局的，落点取决于执行那一刻的前台 App，所以出手前必须再核对一次。 */
+    private fun performSwipeUp(): Boolean {
+        if (!screenOn()) return false
+        if (!TARGET_PACKAGES.contains(activeWindowPackage())) return false
         val metrics = resources.displayMetrics
         val path = Path().apply {
             moveTo(metrics.widthPixels / 2f, metrics.heightPixels * 0.7f)
@@ -597,6 +605,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
             override fun onCompleted(gd: GestureDescription?) { Log.d(TAG, "滑动完成") }
             override fun onCancelled(gd: GestureDescription?) { Log.w(TAG, "滑动取消") }
         }, null)
+        return true
     }
 
     // ==================== 广播 ====================
