@@ -507,6 +507,8 @@ class BiliUiSkip(
             ) {
                 val r = Rect()
                 n.getBoundsInScreen(r)
+                // 实测该节点支持 ACTION_SET_PROGRESS，但无障碍进度值只有 0-100（29 分钟视频
+                // 一档 17.8 秒），落点精度不如 seekTo 与拖动，所以不用它
                 if (r.width() > 400 && r.height() in 6..240) barRect = r
             }
             // 页面里“49.2万播放”这类文案也含“播放”，只认播放器按钮的精确描述
