@@ -159,6 +159,9 @@ class BiliPlaybackWatcher : NotificationListenerService() {
             pendingResolve = title to hintedBvid
             return
         }
+        // 切视频时 onListenerDisconnected/onDestroy 会先关掉线程池，迟到的会话回调再
+        // execute 就抛 RejectedExecutionException，把整个进程（含无障碍服务、撤回气泡）带崩
+        if (io.isShutdown) return
         resolving = true
         Stats.log("解析视频：${title.take(18)}…")
         io.execute {
