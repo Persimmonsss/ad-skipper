@@ -141,7 +141,15 @@ class AdSkipAccessibilityService : AccessibilityService() {
     /** B站前台时才跑；离开 B站即停，避免常驻 1s 唤醒。 */
     private val biliTicker = object : Runnable {
         override fun run() {
-            if (foregroundPkg != BiliUiSkip.BILI_PKG || !screenOn()) return
+            if (!screenOn()) return
+            if (foregroundPkg != BiliUiSkip.BILI_PKG) {
+                // 断链前先核对一次活动窗口：前台包名可能被别的窗口事件顶掉，而 B站详情页
+                // 播放期间几乎没有无障碍事件，一断链就要等 periodicCheck 的 30 秒兜底才复活
+                // （实测倒计时气泡出现那一瞬被本 App 的窗口事件顶掉，跳过晚了 31 秒，广告都播半段了）
+                if (activeWindowPackage() != BiliUiSkip.BILI_PKG) return
+                foregroundPkg = BiliUiSkip.BILI_PKG
+                foregroundAt = SystemClock.elapsedRealtime()
+            }
             try {
                 biliUi.tick()
             } catch (e: Exception) {
@@ -249,7 +257,9 @@ class AdSkipAccessibilityService : AccessibilityService() {
         val pkg = event.packageName?.toString()
         val appSwitched = pkg != null && pkg != foregroundPkg
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && pkg != null) {
-            foregroundPkg = pkg
+            // 自己的倒计时/撤回气泡也是本包的窗口事件，不能当成「切到了本 App」：
+            // 气泡正好在广告前 3 秒出现，一顶掉前台包名就会打断 B站扫描
+            foregroundPkg = if (pkg == packageName) activeWindowPackage().ifEmpty { pkg } else pkg
             foregroundAt = SystemClock.elapsedRealtime()
         }
         if (Settings.splashEnabled) {
