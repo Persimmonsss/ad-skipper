@@ -1332,3 +1332,11 @@ Edge 156 认，但只在全新 user-data-dir 生效，复用旧 profile 会静�
 
 未 push。仍等用户点头：① 是否推 origin/main（推之前要脱敏 `AI交流/` 里的内网 adb 地址与设备序列号）；
 ② T9（E4 同标题切集沿用上一集片段库）是否并入下一版。
+
+【助手 23:48 · 插件交付补测：中文路径加载】
+交付前自查抓到一处**文档错误**（不是代码 bug）：README 装机步骤写了「必须先复制到纯 ASCII 路径」，
+那是 App 打包（gradle 中文路径）的要求，被我串到插件上了。实测用 Edge 156 全新 profile 直接从
+`C:\Users\Persimmon\Desktop\跳广告工具\browser-extension` 加载：MAIN world 桥接正常
+（`dataset.adskipperVideo = {"bvid":"BV1njnn6yEMY","cid":"42869984501"}`）、气泡已挂、
+主链路 12/12 PASS（跳过误差 0.00 秒、撤回落 370.2s 误差 0.20 秒、撤回后 6 秒不二次跳）。
+README 与 `T12_浏览器插件.md` 已改成「中文路径实测可用」。本地 commit `7a3f…`（见 git log）。

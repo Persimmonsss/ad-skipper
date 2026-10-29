@@ -185,7 +185,8 @@ Android 免 root 广告跳过工具（无障碍服务实现）。当前版本 v2
 
 装机（未上扩展商店，只能开发者模式加载）：
 
-1. 把 `browser-extension/` 放到**纯 ASCII 路径**（工程根目录带中文时先复制出去）；
+1. 直接选仓库里的 `browser-extension/` 目录即可，**中文路径实测可用**（从 `C:\Users\...\跳广告工具\browser-extension`
+   加载后主链路 12/12 全通；「纯 ASCII 路径」只是 App 打包时的要求，插件不需要）；
 2. Edge 开 `edge://extensions`、Chrome 开 `chrome://extensions`，打开「开发人员模式」；
 3. 「加载未打包的扩展」→ 选 `browser-extension` 目录；
 4. 打开任意 B 站视频页即生效，无需登录、无需其它权限。
