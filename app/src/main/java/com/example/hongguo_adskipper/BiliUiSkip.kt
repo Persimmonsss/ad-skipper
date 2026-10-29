@@ -45,6 +45,7 @@ class BiliUiSkip(
     private var pendingTarget = 0L
     private var pendingBeforePos: Long? = null
     private var lastBvid: String? = null
+    private var hadSegs = false
     private var lastPosLog = 0L
     private var lastStateLog = 0L
     private var lastBarLog = ""
@@ -62,13 +63,25 @@ class BiliUiSkip(
     /** 由无障碍事件驱动：读一次界面并处理。 */
     fun onEvent(rootProvider: () -> AccessibilityNodeInfo?) {
         val now = SystemClock.elapsedRealtime()
-        // 没有广告段或已暂停时只为仪表盘刷新进度，没必要 300ms 扫一次
-        val interval = if (Stats.biliSegList.isEmpty() || paused == true) 1000L else SCAN_INTERVAL_MS
+        // B站 详情页事件很密（弹幕、评论、推荐位都在刷 WINDOW_CONTENT_CHANGED），300ms 扫一次
+        // 全树是前台主要开销（K40 实测 0.7%~4.5%）。只有确实快走到某个还没跳过的广告段时
+        // 才需要这个精度，其余时间 1 秒一次足够维持仪表盘读数。
+        val interval = if (adCloseBy(now)) SCAN_INTERVAL_MS else 1000L
         if (now - lastScan < interval) return
         lastScan = now
         resetIfVideoChanged()
         scanInto(rootProvider())
         apply(now)
+    }
+
+    /** 是否快到需要精细扫描的广告段（前 90 秒内到后 15 秒内，且这段还没跳过）。 */
+    private fun adCloseBy(now: Long): Boolean {
+        val segs = Stats.biliSegList
+        if (segs.isEmpty() || paused == true) return false
+        val est = posMs + (now - posAt)
+        return segs.any {
+            !skipped.contains(it.uuid) && est in (it.startMs - 90_000L)..(it.endMs + 15_000L)
+        }
     }
 
     /** 由服务定时器驱动：控件隐藏时靠外推决定何时唤出控件。 */
@@ -150,16 +163,20 @@ class BiliUiSkip(
 
     private fun resetIfVideoChanged() {
         val bvid = Stats.biliBvid
-        if (bvid != lastBvid) {
-            lastBvid = bvid
-            skipped.clear()
-            attempts.clear()
-            pendingSeg = null
-            bar = null
-            undoUuid = null
-            undoUntil = 0
-            bubble.hide()
-        }
+        val hasSegs = Stats.biliSegList.isNotEmpty()
+        // 退出视频再进同一条时 bvid 不变，但会话销毁会把片段库清空、重新解析又填回来，
+        // 靠这个「空→非空」跃变认出新会话：不清 skipped 的话这条视频的广告段第二次起永远不跳
+        val newSession = hasSegs && !hadSegs
+        hadSegs = hasSegs
+        if (bvid == lastBvid && !newSession) return
+        lastBvid = bvid
+        skipped.clear()
+        attempts.clear()
+        pendingSeg = null
+        bar = null
+        undoUuid = null
+        undoUntil = 0
+        bubble.hide()
     }
 
     private fun scanInto(root: AccessibilityNodeInfo?) {
@@ -368,7 +385,7 @@ class BiliUiSkip(
         posMs = to
         posAt = SystemClock.elapsedRealtime()
         Stats.biliPositionMs = posMs
-        if (Stats.biliSkipCount > 0) Stats.biliSkipCount--
+        Stats.biliUndoCount++
         Stats.biliLastSkip = "已撤回 → ${fmt(to)}"
         Stats.log("撤回跳过，回到 ${fmt(to)}")
         main.postDelayed({ verifyUndo(to) }, 1200)

@@ -20,6 +20,7 @@ object Stats {
     @Volatile var biliDurationMs: Long = 0
     @Volatile var biliSkipCount: Int = 0
     @Volatile var biliLastSkip: String = "-"
+    @Volatile var biliUndoCount: Int = 0
     @Volatile var splashClickCount: Int = 0
     @Volatile var splashLastTarget: String = "-"
     @Volatile var lastError: String? = null
