@@ -61,6 +61,9 @@ class BiliPlaybackWatcher : NotificationListenerService() {
             main.post {
                 Stats.biliTitle = "-"
                 Stats.biliSegList = emptyList()
+                // 重开同一个视频时标题不变，不清掉会走 "title == currentTitle" 提前返回，
+                // 片段库永远停在空列表，跳过整场失效
+                currentTitle = null
             }
         }
     }
@@ -99,6 +102,7 @@ class BiliPlaybackWatcher : NotificationListenerService() {
         val target = list?.firstOrNull { it.packageName == BILI_PKG }
         if (target == null) {
             if (controller != null) releaseController()
+            currentTitle = null
             return
         }
         if (target.sessionToken == controller?.sessionToken) return
@@ -113,9 +117,11 @@ class BiliPlaybackWatcher : NotificationListenerService() {
         controller = null
     }
 
-    /** 合集/自动连播会给标题追加“自动连播(131/526)”，不清理会匹配不到 BV。 */
+    /** 合集会给标题追加“自动连播(131/526)”“单集循环(131/526)”，末尾还可能带 null，不清理会匹配不到 BV。 */
     private fun cleanTitle(raw: String): String =
-        raw.replace(Regex("""\s*自动连播.*$"""), "").trim()
+        raw.replace(Regex("""[,，]?\s*(自动连播|单集循环)\s*[（(]?\d*(?:[/／]\d*)?[)）]?"""), "")
+            .replace(Regex("""[,，]?\s*null\s*$"""), "")
+            .trim(' ', ',', '，')
 
     private fun handleMetadata(metadata: MediaMetadata?) {
         if (metadata == null) return
