@@ -75,9 +75,13 @@ class BiliUiSkip(
             return
         }
         val now = SystemClock.elapsedRealtime()
-        // 暂停时 B站 也会自动隐藏控件，读数会陈旧；陈旧了就先重读一次再判断
+        // 暂停时 B站 也会自动隐藏控件，读数会陈旧；但只有停在广告段附近才值得点一下屏幕
+        // 重读，否则用户暂停看评论时会被我们反复唤出控件
         if (paused == true) {
-            if (now - posAt > 5000 && now - lastBootstrap > 8000) {
+            val near = Stats.biliSegList.any {
+                !skipped.contains(it.uuid) && posMs in (it.startMs - 90_000)..it.endMs
+            }
+            if (near && now - posAt > 5000 && now - lastBootstrap > 8000) {
                 lastBootstrap = now
                 reanchor()
             }
