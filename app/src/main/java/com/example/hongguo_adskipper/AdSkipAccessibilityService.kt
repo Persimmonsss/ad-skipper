@@ -7,6 +7,9 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Color
 import android.graphics.Path
 import android.graphics.Rect
 import android.os.Build
@@ -15,6 +18,7 @@ import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
+import android.view.Display
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
@@ -53,8 +57,6 @@ class AdSkipAccessibilityService : AccessibilityService() {
             "立即下载", "了解更多", "查看详情",
             "打开应用", "去下载"
         )
-        // 英文 AD 必须独立成词：download 里的 "ad" 不是广告
-        private val RE_AD_WORD = Regex("""(?i)(^|[^a-z])ad([^a-z]|$)""")
         // 抖音信息流只在明确的「广告」角标上出手，CTA 单独出现不算
         private val DOUYIN_AD_BADGE = Regex("""^(广告|廣告|赞助|贊助|推广|推廣)(\s*[·|｜].*)?$""")
 
@@ -62,10 +64,6 @@ class AdSkipAccessibilityService : AccessibilityService() {
 
         // 轮询里反复用到，预编译避免每次检测都新建正则
         private val RE_BARE_DIGIT = Regex("""^\d{1,2}$""")
-        private val RE_COUNTDOWN = listOf(
-            Regex("""\d{1,2}s"""), Regex("""\d{1,2}s后"""),
-            Regex("""\d{1,2}秒后"""), RE_BARE_DIGIT
-        )
         private val RE_EPISODE = listOf(
             Regex("""第\s*(\d+)\s*集"""),
             Regex("""[Ee]pisode\s*(\d+)"""),
@@ -79,6 +77,16 @@ class AdSkipAccessibilityService : AccessibilityService() {
         private const val AD_WAIT_MS = 1500L
         private const val MAX_CONSECUTIVE_SWIPES = 3
         private const val RESET_TIMEOUT_MS = 10000L
+        // 红果广告层底部「上滑继续看短剧」提示条的位置（1080×2340 基准）与匹配阈值
+        private const val HINT_X = 386
+        private const val HINT_Y = 2010
+        private const val HINT_W = 312
+        private const val HINT_H = 32
+        private const val HINT_CELL = 4
+        private const val HINT_SCORE = 0.85f
+        private const val HINT_STREAK_NEED = 2
+        private const val HINT_SAMPLE_MS = 2000L
+        private const val SHOT_MIN_GAP_MS = 1200L
 
         // 开屏广告：应用切到前台后的检测窗口
         private const val SPLASH_WINDOW_MS = 10000L
@@ -102,9 +110,6 @@ class AdSkipAccessibilityService : AccessibilityService() {
             "com.android.systemui", "com.android.launcher", "com.android.settings",
             "com.phoenix.read", "com.miui.home", "com.miui.personalassistant"
         )
-        // isValidAdText 每次命中都要查，别在检测热路径里现建集合
-        private val AD_STRONG_WORDS = setOf("广告", "推广", "跳过广告", "关闭广告", "广告剩余")
-        private val AD_CTA_WORDS = setOf("立即下载", "去下载", "打开应用", "查看详情", "了解更多")
 
         // ========== 统计数据 ==========
         var isServiceEnabled = false
@@ -147,6 +152,10 @@ class AdSkipAccessibilityService : AccessibilityService() {
         private var consecutiveSwipes = 0
         private var lastAdDetectedTime = 0L
         private var wasAdBeforeSwipe = false
+        private var hintStreak = 0
+        private var lastHintSampleAt = 0L
+        private var lastShotAt = 0L
+        private var darkSampleInFlight = false
 
         private val handler = Handler(Looper.getMainLooper())
     }
@@ -204,6 +213,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
         isServiceEnabled = true
         foregroundPkg = activeWindowPackage()
         foregroundAt = SystemClock.elapsedRealtime()
+        hintStreak = 0
         createNotificationChannel()
         showNotification()
         handler.removeCallbacks(periodicCheck)
@@ -412,34 +422,28 @@ class AdSkipAccessibilityService : AccessibilityService() {
 
         // 3. 检测广告
         val pkg = rootNode.packageName?.toString().orEmpty()
-        val detected = detectAdFor(pkg, rootNode, allTexts)
-        if (detected) {
-            adDetectedCount++
-            lastAdDetectedTime = currentTime
-            lastAdTime = formatTime(currentTime)
-            consecutiveSwipes++
-
-            // 记录滑动前是广告
-            wasAdBeforeSwipe = true
-
-            logDebug("广告命中:[$lastAdKeyword] 剧:$dramaTitle 集:$currentEpisode")
-
-            // 执行滑动
-            lastSwipeTime = currentTime
-            adSkipCount++
-
-            sendStatsBroadcast()
-            handler.postDelayed({
-                if (performSwipeUp()) {
-                    logDebug("已执行滑动 第${consecutiveSwipes}次")
-                    // 延迟后再检查一次，判断是否成功跳过
-                    handler.postDelayed({
-                        checkSwipeResult()
-                    }, 2000)
+        if (pkg in HONGGUO_PACKAGES && currentTime - lastHintSampleAt >= HINT_SAMPLE_MS) {
+            // 红果剧间广告画在自家窗口里，无障碍树原样留着上一集的 60 多条文案
+            //（实测：「第12集/选集/评论」全在，广告自身一个字都不进树），文字判定必然误伤。
+            // 唯一稳定的画面标记是广告层底部的「上滑继续看短剧」提示，按模板匹配认它。
+            lastHintSampleAt = currentTime
+            sampleScreenMatch { score ->
+                if (score >= HINT_SCORE) {
+                    hintStreak++
+                    logDebug("提示条匹配 ${(score * 100).toInt()}% 第${hintStreak}拍")
+                    if (hintStreak >= HINT_STREAK_NEED) {
+                        hintStreak = 0
+                        onAdDetected("上滑继续看短剧", System.currentTimeMillis())
+                    }
                 } else {
-                    logDebug("滑动未执行：红果已不在前台")
+                    hintStreak = 0
+                    if (score >= 0.6f) logDebug("提示条近似 ${(score * 100).toInt()}%")
                 }
-            }, AD_WAIT_MS)
+            }
+        }
+        val detected = detectAdFor(pkg, allTexts)
+        if (detected) {
+            onAdDetected(lastAdKeyword, currentTime)
         } else {
             // 当前不是广告，检查上一次滑动是否成功
             if (wasAdBeforeSwipe && (currentTime - lastSwipeTime) > SWIPE_DELAY_MS) {
@@ -455,29 +459,201 @@ class AdSkipAccessibilityService : AccessibilityService() {
         }
     }
 
+    /** 命中广告后的统一动作：计数、记日志、延迟上滑、再复核。 */
+    private fun onAdDetected(keyword: String, currentTime: Long) {
+        lastAdKeyword = keyword
+        adDetectedCount++
+        hintStreak = 0
+        lastAdDetectedTime = currentTime
+        lastAdTime = formatTime(currentTime)
+        consecutiveSwipes++
+        wasAdBeforeSwipe = true
+
+        logDebug("广告命中:[$keyword] 剧:$dramaTitle 集:$currentEpisode")
+
+        lastSwipeTime = currentTime
+        adSkipCount++
+        sendStatsBroadcast()
+        handler.postDelayed({
+            if (performSwipeUp()) {
+                logDebug("已执行滑动 第${consecutiveSwipes}次")
+                // 延迟后再检查一次，判断是否成功跳过
+                handler.postDelayed({
+                    checkSwipeResult()
+                }, 2000)
+            } else {
+                logDebug("滑动未执行：红果已不在前台")
+            }
+        }, AD_WAIT_MS)
+    }
+
+    // ==================== 红果剧间广告：提示条模板匹配 ====================
+
+    /** 模板：广告层底部「上滑继续看短剧」提示条，随包发布，只读一次。 */
+    private val hintTemplate by lazy { loadHintTemplate() }
+
+    private fun loadHintTemplate(): FloatArray {
+        val bmp = try {
+            assets.open("ad_hint.png").use { BitmapFactory.decodeStream(it) }
+        } catch (e: Exception) {
+            Log.w(TAG, "提示条模板读取失败: ${e.message}")
+            null
+        } ?: return FloatArray(0)
+        return cellsOf(bmp.width, bmp.height, HINT_CELL) { x, y -> luminance(bmp.getPixel(x, y)) > 150 }
+    }
+
+    private fun luminance(c: Int): Int =
+        (Color.red(c) * 299 + Color.green(c) * 587 + Color.blue(c) * 114) / 1000
+
+    /** 把区域按 cell×cell 方格二值降采样，抵消抗锯齿和 1-2 像素抖动。 */
+    private fun cellsOf(
+        w: Int, h: Int, cell: Int, at: (Int, Int) -> Boolean
+    ): FloatArray {
+        val cols = maxOf(1, w / cell)
+        val rows = maxOf(1, h / cell)
+        val out = FloatArray(rows * cols)
+        for (r in 0 until rows) {
+            val y0 = r * h / rows
+            val y1 = maxOf(y0 + 1, (r + 1) * h / rows)
+            for (c in 0 until cols) {
+                val x0 = c * w / cols
+                val x1 = maxOf(x0 + 1, (c + 1) * w / cols)
+                var hit = 0
+                for (y in y0 until y1) for (x in x0 until x1) if (at(x, y)) hit++
+                out[r * cols + c] = hit.toFloat() / ((y1 - y0) * (x1 - x0))
+            }
+        }
+        return out
+    }
+
+    /** 在提示条的固定位置附近做 NCC（归一化互相关），返回 0-1 相似度。 */
+    private fun hintScore(bmp: Bitmap): Float {
+        val t = hintTemplate
+        if (t.isEmpty()) return 0f
+        val cols = maxOf(1, HINT_W / HINT_CELL)
+        val rows = maxOf(1, HINT_H / HINT_CELL)
+        val sx = bmp.width / 1080f
+        val sy = bmp.height / 2340f
+        val w = maxOf(cols, (HINT_W * sx).toInt())
+        val h = maxOf(rows, (HINT_H * sx).toInt())
+        val padX = maxOf(4, (24 * sx).toInt())
+        val padY = maxOf(4, (20 * sy).toInt())
+        val gx = (HINT_X * sx).toInt() - padX
+        val gy = (HINT_Y * sy).toInt() - padY
+        val gw = w + padX * 2
+        val gh = h + padY * 2
+        if (gx < 0 || gy < 0 || gx + gw > bmp.width || gy + gh > bmp.height) return 0f
+
+        // 一次取完像素，九个候选位移复用
+        val bits = BooleanArray(gw * gh)
+        for (y in 0 until gh) for (x in 0 until gw) {
+            bits[y * gw + x] = luminance(bmp.getPixel(gx + x, gy + y)) > 150
+        }
+        var best = -1f
+        for (dy in intArrayOf(-padY, 0, padY)) for (dx in intArrayOf(-padX, 0, padX)) {
+            val cells = FloatArray(rows * cols)
+            for (r in 0 until rows) {
+                val y0 = dy + r * h / rows
+                val y1 = dy + maxOf(r * h / rows + 1, (r + 1) * h / rows)
+                for (c in 0 until cols) {
+                    val x0 = dx + c * w / cols
+                    val x1 = dx + maxOf(c * w / cols + 1, (c + 1) * w / cols)
+                    var hit = 0
+                    for (y in y0 until y1) for (x in x0 until x1) {
+                        if (x in 0 until gw && y in 0 until gh && bits[y * gw + x]) hit++
+                    }
+                    cells[r * cols + c] = hit.toFloat() / ((y1 - y0) * (x1 - x0))
+                }
+            }
+            val s = ncc(cells, t)
+            if (s > best) best = s
+        }
+        return best
+    }
+
+    private fun ncc(a: FloatArray, b: FloatArray): Float {
+        val n = minOf(a.size, b.size)
+        if (n == 0) return 0f
+        var ma = 0f
+        var mb = 0f
+        for (i in 0 until n) { ma += a[i]; mb += b[i] }
+        ma /= n; mb /= n
+        var num = 0f
+        var da = 0f
+        var db = 0f
+        for (i in 0 until n) {
+            val x = a[i] - ma
+            val y = b[i] - mb
+            num += x * y
+            da += x * x
+            db += y * y
+        }
+        val den = kotlin.math.sqrt(da * db)
+        return if (den < 1e-6f) 0f else num / den
+    }
+
+    /** 截图算提示条相似度；失败按「非广告」处理，宁可漏判也不误滑。 */
+    private fun sampleScreenMatch(retried: Boolean = false, onResult: (Float) -> Unit) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R || darkSampleInFlight) return
+        // 系统对 takeScreenshot 有最小间隔（连拍会报 error 3），错开一拍再试
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastShotAt < SHOT_MIN_GAP_MS) {
+            if (!retried) handler.postDelayed({ sampleScreenMatch(true, onResult) }, SHOT_MIN_GAP_MS)
+            return
+        }
+        darkSampleInFlight = true
+        lastShotAt = now
+        try {
+            takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor, object : TakeScreenshotCallback {
+                override fun onSuccess(result: ScreenshotResult) {
+                    darkSampleInFlight = false
+                    var score = 0f
+                    try {
+                        val hw = Bitmap.wrapHardwareBuffer(result.hardwareBuffer, result.colorSpace)
+                        val sw = hw?.copy(Bitmap.Config.ARGB_8888, false)
+                        if (sw != null) score = hintScore(sw)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "截图分析失败: ${e.message}")
+                    } finally {
+                        result.hardwareBuffer.close()
+                    }
+                    onResult(score)
+                }
+
+                override fun onFailure(errorCode: Int) {
+                    darkSampleInFlight = false
+                    Log.w(TAG, "截图失败: $errorCode")
+                    onResult(0f)
+                }
+            })
+        } catch (e: Exception) {
+            darkSampleInFlight = false
+            Log.w(TAG, "截图异常: ${e.message}")
+            onResult(0f)
+        }
+    }
+
     /**
-     * 检查滑动结果
+     * 检查滑动结果：广告页是无障碍树里看不出来的覆盖层，复核同样按画面判。
      */
     private fun checkSwipeResult() {
-        // 滑动 + 复核一共延了 3.5 秒，用户可能已经按了电源；息屏时读节点既没意义也费电
+        // 滑动 + 复核一共延了 3.5 秒，用户可能已经按了电源；息屏时截图既没意义也费电
         if (!screenOn()) return
         val rootNode = activeWindowRoot() ?: return
         val packageName = rootNode.packageName?.toString() ?: return
         if (!TARGET_PACKAGES.contains(packageName)) return
 
-        val allTexts = mutableListOf<String>()
-        collectAllTexts(rootNode, allTexts, 0, 15)
-
-        // 复核必须和检测用同一套口径，否则抖音跳完会被判成「仍在广告页面」
-        val stillAd = detectAdFor(packageName, rootNode, allTexts)
-        if (stillAd) {
-            adSkipFailCount++
-            logDebug("滑动可能失败，仍在广告页面")
-        } else {
-            adSkipSuccessCount++
-            logDebug("滑动成功，已离开广告")
+        sampleScreenMatch { score ->
+            val stillAd = score >= HINT_SCORE
+            if (stillAd) {
+                adSkipFailCount++
+                logDebug("滑动可能失败，提示条还在 ${(score * 100).toInt()}%")
+            } else {
+                adSkipSuccessCount++
+                logDebug("滑动成功，已离开广告")
+            }
+            sendStatsBroadcast()
         }
-        sendStatsBroadcast()
     }
 
     // ==================== 短剧信息提取 ====================
@@ -503,6 +679,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
                 !trimmed.contains("免费") &&
                 !trimmed.contains("下载") &&
                 !trimmed.contains("打开") &&
+                // 红果的「（番茄）微短剧备字（2026）第072837号」备案号比标题长，会把标题顶掉
+                !trimmed.contains("备字") &&
                 !RE_CLOCK.matches(trimmed) &&
                 !RE_CLOCK3.matches(trimmed)
             ) {
@@ -524,50 +702,12 @@ class AdSkipAccessibilityService : AccessibilityService() {
 
     // ==================== 广告检测 ====================
 
-    /** 红果用宽启发式；抖音只认明确的「广告」角标，宽关键词表会误判普通视频。 */
-    private fun detectAdFor(pkg: String, node: AccessibilityNodeInfo, allTexts: List<String>): Boolean =
-        if (pkg == DOUYIN_PKG) detectDouyinAd(allTexts) else detectAd(node, allTexts)
-
-    private fun detectAd(node: AccessibilityNodeInfo, allTexts: List<String>): Boolean {
-        if (allTexts.isEmpty()) return false
-
-        // 策略1：文字关键词
-        for (text in allTexts) {
-            val trimmed = text.trim()
-            if (trimmed.isEmpty()) continue
-            if (trimmed.length <= 10 && RE_AD_WORD.containsMatchIn(trimmed)) {
-                lastAdKeyword = "\"$trimmed\"→AD"
-                return true
-            }
-            for (keyword in AD_KEYWORDS) {
-                if (trimmed.contains(keyword, ignoreCase = true)) {
-                    if (isValidAdText(trimmed, keyword)) {
-                        lastAdKeyword = "\"$trimmed\"→$keyword"
-                        return true
-                    }
-                }
-            }
-        }
-
-        // 策略2：倒计时
-        // 选集面板等信息流页面会有一堆纯数字节点，不能当倒计时
-        val bareDigits = allTexts.count { RE_BARE_DIGIT.matches(it.trim()) }
-        for (text in allTexts) {
-            val trimmed = text.trim()
-            if (!matchesAdCountdown(trimmed)) continue
-            if (bareDigits >= 3 && RE_BARE_DIGIT.matches(trimmed)) continue
-            lastAdKeyword = "倒计时:\"$trimmed\""
-            return true
-        }
-
-        // 策略3：广告SDK控件
-        if (hasAdSdkViews(node)) {
-            lastAdKeyword = "SDK控件"
-            return true
-        }
-
-        return false
-    }
+    /**
+     * 只有抖音按文字判定。红果的无障碍树是整叠页面的并集（实测广告页仍带着上一集
+     * 62 条剧集文案，连「第12集/选集」都在），文字判定必然误伤，改由画面黑屏判定。
+     */
+    private fun detectAdFor(pkg: String, allTexts: List<String>): Boolean =
+        pkg == DOUYIN_PKG && detectDouyinAd(allTexts)
 
     private fun detectDouyinAd(allTexts: List<String>): Boolean {
         for (text in allTexts) {
@@ -589,23 +729,6 @@ class AdSkipAccessibilityService : AccessibilityService() {
             val child = node.getChild(i) ?: continue
             collectAllTexts(child, result, depth + 1, maxDepth)
         }
-    }
-
-    private fun isValidAdText(text: String, keyword: String): Boolean {
-        if (keyword in AD_STRONG_WORDS) return true
-        // 「跳过」单独出现太宽：短剧标题里的「跳过这集」不是按钮
-        if (keyword == "跳过") return text.length <= 8 && !text.contains("集") && !text.contains("话")
-        return keyword in AD_CTA_WORDS
-    }
-
-    private fun matchesAdCountdown(text: String): Boolean {
-        for (p in RE_COUNTDOWN) {
-            if (p.containsMatchIn(text) && text.length <= 10) {
-                if (text.length == 2 && text.all { it.isDigit() }) continue
-                return true
-            }
-        }
-        return false
     }
 
     private fun hasAdSdkViews(node: AccessibilityNodeInfo) = checkNodeForAdSdk(node, 0, 10)
@@ -806,7 +929,12 @@ class AdSkipAccessibilityService : AccessibilityService() {
         try {
             for (w in windows) {
                 val root = w.root
-                parts.add("${w.type}:${root?.packageName?.toString()?.substringAfterLast('.') ?: "?"}")
+                val n = ArrayList<String>()
+                if (root != null) collectAllTexts(root, n, 0, 15)
+                parts.add(
+                    "${w.type}:${root?.packageName?.toString()?.substringAfterLast('.') ?: "?"}" +
+                        "${if (w.isActive) "A" else ""}${if (w.isFocused) "F" else ""}(${n.size})"
+                )
             }
         } catch (e: Exception) {
             parts.add("err")
