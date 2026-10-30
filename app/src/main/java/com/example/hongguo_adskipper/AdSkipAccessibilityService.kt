@@ -24,11 +24,19 @@ import android.view.accessibility.AccessibilityNodeInfo
  */
 class AdSkipAccessibilityService : AccessibilityService() {
 
+    // 版本号只从 build.gradle.kts 取，避免第二个手写常量跟不上发版
+    private val appVersion: String by lazy {
+        runCatching { packageManager.getPackageInfo(packageName, 0).versionName }
+            .getOrNull().orEmpty()
+    }
+
+    private val notificationTitle: String
+        get() = if (appVersion.isEmpty()) "跳跳狐" else "跳跳狐 v$appVersion"
+
     companion object {
         private const val TAG = "AdSkipService"
         private const val CHANNEL_ID = "ad_skip_channel"
         private const val NOTIFICATION_ID = 1
-        const val VERSION = "v2.1.1"
 
         private val TARGET_PACKAGES = listOf(
             "com.phoenix.read",
@@ -179,7 +187,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
         handler.removeCallbacks(biliTicker)
         handler.postDelayed(periodicCheck, CHECK_INTERVAL_MS)
         if (foregroundPkg == BiliUiSkip.BILI_PKG) ensureBiliTicker()
-        logDebug("服务已启动 $VERSION")
+        logDebug("服务已启动 $notificationTitle")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -197,9 +205,9 @@ class AdSkipAccessibilityService : AccessibilityService() {
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
-                CHANNEL_ID, "广告跳过服务", NotificationManager.IMPORTANCE_LOW
+                CHANNEL_ID, "跳跳狐服务", NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "红果广告跳过器运行状态"
+                description = "跳跳狐运行状态"
                 setShowBadge(false)
             }
             getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
@@ -220,7 +228,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
         val text = "检测:${hongguoDetectedCount}次 广告:${adDetectedCount}次 跳过:${adSkipCount}次"
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, CHANNEL_ID)
-                .setContentTitle("红果广告跳过器 $VERSION")
+                .setContentTitle(notificationTitle)
                 .setContentText(text)
                 .setStyle(Notification.BigTextStyle().bigText("$text\n短剧: $dramaTitle $currentEpisode\n$debugLog"))
                 .setSmallIcon(android.R.drawable.ic_media_play)
@@ -230,7 +238,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
         } else {
             @Suppress("DEPRECATION")
             Notification.Builder(this)
-                .setContentTitle("红果广告跳过器 $VERSION")
+                .setContentTitle(notificationTitle)
                 .setContentText(text)
                 .setSmallIcon(android.R.drawable.ic_media_play)
                 .setContentIntent(pendingIntent)

@@ -1340,3 +1340,27 @@ Edge 156 认，但只在全新 user-data-dir 生效，复用旧 profile 会静�
 （`dataset.adskipperVideo = {"bvid":"BV1njnn6yEMY","cid":"42869984501"}`）、气泡已挂、
 主链路 12/12 PASS（跳过误差 0.00 秒、撤回落 370.2s 误差 0.20 秒、撤回后 6 秒不二次跳）。
 README 与 `T12_浏览器插件.md` 已改成「中文路径实测可用」。本地 commit `7a3f…`（见 git log）。
+
+【助手 13:55 · 改名「跳跳狐」】
+用户要求 App 与浏览器插件统一改名。只动用户可见的名字，不动包名（改了就是另一个 App，
+四个权限要重配、旧版本也不会被覆盖升级）：包名仍是 `com.example.hongguo_adskipper`，
+仓库名仍是 `ad-skipper`，本机目录仍叫「跳广告工具」。
+
+改了哪里：
+- `strings.xml`：app_name=跳跳狐、a11y_service_label=跳跳狐（无障碍）、nls_service_label=跳跳狐（B站播放监听）；
+  仪表盘大标题与图标 contentDescription 都引用 app_name，所以一处改全站生效。
+- `AdSkipAccessibilityService.kt`：通知渠道名「跳跳狐服务」/ 描述「跳跳狐运行状态」/ 两处 setContentTitle。
+  顺手修了一个**版本号第二来源**：原来 `const val VERSION = "v2.1.1"` 写死在服务里，改完名通知标题还是
+  「跳跳狐 v2.1.1」（真机实测抓到），现改为运行时读 PackageManager.versionName，与 build.gradle.kts 单一来源。
+- `browser-extension/manifest.json` + `options.html`：name/description/default_title/title 全部改为「跳跳狐 · B站广告跳过」。
+- `README.md`：标题、正文、版本号（v2.2.1）+ 一段「改名不动包名」的说明。
+- `build.gradle.kts`：versionCode 6→7、versionName 2.2.0→2.2.1（改名要出新包，版本号得往上走才能覆盖升级）。
+
+真机验收（K40，覆盖安装 799ms）：
+- aapt：application-label='跳跳狐'，versionCode=7 / versionName=2.2.1；
+- 仪表盘标题「跳跳狐」+ 狐狸图标，四个权限状态全绿；
+- 系统「应用信息」页：跳跳狐 / 版本 2.2.1 / 狐狸图标；
+- 前台通知标题「跳跳狐 v2.2.1」、渠道名「跳跳狐服务」；
+- logcat：服务存活、开屏扫描正常（说明改名没碰坏逻辑）。
+包：桌面 `ad-skipper-v2.2.1.apk`（5.38MB，md5 `69709bbe8bfb83c46a545ccf5ee2b8f5`，Debug 证书 SHA-256
+`7d58bacc…`，与旧包同证书可覆盖安装）。
