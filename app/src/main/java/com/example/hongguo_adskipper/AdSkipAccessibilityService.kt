@@ -69,6 +69,10 @@ class AdSkipAccessibilityService : AccessibilityService() {
             Regex("""[Ee]pisode\s*(\d+)"""),
             Regex("""^\s*(\d+)\s*/\s*\d+\s*$""")
         )
+        // 剧名提取（T14 待办 2：热评/展开/声明/[ 一律不算剧名）
+        private val RE_TITLE_PIPE = Regex("""^.{0,20}?第[一二三四五六七八九十\d]+集\s*[|｜]\s*(.+)$""")
+        private val RE_TITLE_SEASON = Regex("""^.{2,40}第[一二三四五六七八九十\d]+季$""")
+        private val RE_FINISHED = Regex("""已完结|全\s*\d+\s*集""")
         private val RE_INT = Regex("""\d+""")
         private val RE_CLOCK = Regex("""\d{1,2}:\d{2}""")
         private val RE_CLOCK3 = Regex("""\d{1,2}:\d{2}:\d{2}""")
@@ -78,10 +82,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
         private const val MAX_CONSECUTIVE_SWIPES = 3
         private const val RESET_TIMEOUT_MS = 10000L
         // 红果广告层底部「上滑继续看短剧」提示条的位置（1080×2340 基准）与匹配阈值
-        private const val HINT_X = 386
-        private const val HINT_Y = 2010
-        private const val HINT_W = 312
-        private const val HINT_H = 32
+        // 提示条模板匹配：多模板池（assets/ad_hint*.png），底部大范围搜索（matchHint 内实现），
+        // 不再用固定坐标/固定尺寸（红果提示条排版与位置随广告渲染浮动）
         private const val HINT_CELL = 4
         private const val HINT_SCORE = 0.85f
         private const val HINT_STREAK_NEED = 2
@@ -489,17 +491,31 @@ class AdSkipAccessibilityService : AccessibilityService() {
 
     // ==================== 红果剧间广告：提示条模板匹配 ====================
 
-    /** 模板：广告层底部「上滑继续看短剧」提示条，随包发布，只读一次。 */
-    private val hintTemplate by lazy { loadHintTemplate() }
+    /** 提示条模板池：红果不同广告渲染的提示条排版不同（「上滑继续看短剧」/「上滑继续观看短剧」，
+     *  字号与位置都浮动），多模板 + 底部大范围搜索兜底。 */
+    private class HintTemplate(val cells: FloatArray, val cols: Int, val rows: Int, val w: Int, val h: Int)
 
-    private fun loadHintTemplate(): FloatArray {
-        val bmp = try {
-            assets.open("ad_hint.png").use { BitmapFactory.decodeStream(it) }
-        } catch (e: Exception) {
-            Log.w(TAG, "提示条模板读取失败: ${e.message}")
-            null
-        } ?: return FloatArray(0)
-        return cellsOf(bmp.width, bmp.height, HINT_CELL) { x, y -> luminance(bmp.getPixel(x, y)) > 150 }
+    private val hintTemplates by lazy { loadHintTemplates() }
+
+    private fun loadHintTemplates(): List<HintTemplate> {
+        val out = ArrayList<HintTemplate>()
+        for (name in listOf("ad_hint.png", "ad_hint2.png")) {
+            try {
+                val bmp = assets.open(name).use { BitmapFactory.decodeStream(it) }
+                if (bmp != null) {
+                    val cols = maxOf(1, bmp.width / HINT_CELL)
+                    val rows = maxOf(1, bmp.height / HINT_CELL)
+                    val cells = cellsOf(bmp.width, bmp.height, HINT_CELL) { x, y ->
+                        luminance(bmp.getPixel(x, y)) > 150
+                    }
+                    out.add(HintTemplate(cells, cols, rows, bmp.width, bmp.height))
+                    Log.i(TAG, "提示条模板加载: $name ${bmp.width}x${bmp.height}")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "提示条模板 $name 读取失败: ${e.message}")
+            }
+        }
+        return out
     }
 
     private fun luminance(c: Int): Int =
@@ -526,49 +542,74 @@ class AdSkipAccessibilityService : AccessibilityService() {
         return out
     }
 
-    /** 在提示条的固定位置附近做 NCC（归一化互相关），返回 0-1 相似度。 */
-    private fun hintScore(bmp: Bitmap): Float {
-        val t = hintTemplate
-        if (t.isEmpty()) return 0f
-        val cols = maxOf(1, HINT_W / HINT_CELL)
-        val rows = maxOf(1, HINT_H / HINT_CELL)
-        val sx = bmp.width / 1080f
-        val sy = bmp.height / 2340f
-        val w = maxOf(cols, (HINT_W * sx).toInt())
-        val h = maxOf(rows, (HINT_H * sx).toInt())
-        val padX = maxOf(4, (24 * sx).toInt())
-        val padY = maxOf(4, (20 * sy).toInt())
-        val gx = (HINT_X * sx).toInt() - padX
-        val gy = (HINT_Y * sy).toInt() - padY
-        val gw = w + padX * 2
-        val gh = h + padY * 2
-        if (gx < 0 || gy < 0 || gx + gw > bmp.width || gy + gh > bmp.height) return 0f
-
-        // 一次取完像素，九个候选位移复用
-        val bits = BooleanArray(gw * gh)
-        for (y in 0 until gh) for (x in 0 until gw) {
-            bits[y * gw + x] = luminance(bmp.getPixel(gx + x, gy + y)) > 150
+    /**
+     * 底部大范围搜索 + 多模板 NCC（归一化互相关），返回 0-1 相似度。
+     * 提示条锚定「距屏幕底 130-340px、x 中心偏右」，预降采样粗搜（cell 网格）→ 1px 精搜，
+     * 兼容提示条位置/排版浮动（实测 y 在 185-298px 距底之间变化，旧固定坐标 ±20px 会漏）。
+     */
+    private fun matchHint(bmp: Bitmap): Float {
+        val templates = hintTemplates
+        if (templates.isEmpty()) return 0f
+        val sw = bmp.width
+        val sh = bmp.height
+        val sx = sw / 1080f
+        val sy = sh / 2340f
+        val x0 = (346 * sx).toInt()
+        val y0 = (sh - (340 * sy)).toInt()
+        val x1 = (756 * sx).toInt()
+        val y1 = (sh - (130 * sy)).toInt()
+        if (x1 <= x0 || y1 <= y0) return 0f
+        val cell = HINT_CELL
+        // 区域宽高圆整到 cell 整数倍，保证与模板网格同为 cell 像素
+        val rw = (x1 - x0) / cell * cell
+        val rh = (y1 - y0) / cell * cell
+        if (rw <= 0 || rh <= 0) return 0f
+        val gcols = rw / cell
+        val grows = rh / cell
+        val region = cellsOf(rw, rh, cell) { dx, dy ->
+            luminance(bmp.getPixel(x0 + dx, y0 + dy)) > 150
         }
         var best = -1f
-        for (dy in intArrayOf(-padY, 0, padY)) for (dx in intArrayOf(-padX, 0, padX)) {
-            val cells = FloatArray(rows * cols)
-            for (r in 0 until rows) {
-                val y0 = dy + r * h / rows
-                val y1 = dy + maxOf(r * h / rows + 1, (r + 1) * h / rows)
-                for (c in 0 until cols) {
-                    val x0 = dx + c * w / cols
-                    val x1 = dx + maxOf(c * w / cols + 1, (c + 1) * w / cols)
-                    var hit = 0
-                    for (y in y0 until y1) for (x in x0 until x1) {
-                        if (x in 0 until gw && y in 0 until gh && bits[y * gw + x]) hit++
+        for (t in templates) {
+            if (grows - t.rows < 0 || gcols - t.cols < 0) continue
+            // 粗搜：cell 网格滑动
+            var tBest = -1f
+            var bestCx = 0
+            var bestCy = 0
+            for (gy in 0..(grows - t.rows)) {
+                val rowBase = gy * gcols
+                for (gx in 0..(gcols - t.cols)) {
+                    val a = FloatArray(t.cells.size)
+                    var i = 0
+                    for (r in 0 until t.rows) {
+                        val base = rowBase + r * gcols + gx
+                        for (c in 0 until t.cols) a[i++] = region[base + c]
                     }
-                    cells[r * cols + c] = hit.toFloat() / ((y1 - y0) * (x1 - x0))
+                    val s = ncc(a, t.cells)
+                    if (s > tBest) {
+                        tBest = s
+                        bestCx = gx
+                        bestCy = gy
+                    }
                 }
             }
-            val s = ncc(cells, t)
-            if (s > best) best = s
+            // 精搜：像素 ±cell（NCC 对 1-2px 位移敏感，粗搜网格可能错过精确位置）
+            val px0 = x0 + bestCx * cell
+            val py0 = y0 + bestCy * cell
+            for (dy in -cell..cell) {
+                for (dx in -cell..cell) {
+                    val cx = px0 + dx
+                    val cy = py0 + dy
+                    if (cx < 0 || cy < 0 || cx + t.w > sw || cy + t.h > sh) continue
+                    val a = cellsOf(t.w, t.h, cell) { ox, oy ->
+                        luminance(bmp.getPixel(cx + ox, cy + oy)) > 150
+                    }
+                    val s = ncc(a, t.cells)
+                    if (s > best) best = s
+                }
+            }
         }
-        return best
+        return maxOf(0f, best)
     }
 
     private fun ncc(a: FloatArray, b: FloatArray): Float {
@@ -611,7 +652,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
                     try {
                         val hw = Bitmap.wrapHardwareBuffer(result.hardwareBuffer, result.colorSpace)
                         val sw = hw?.copy(Bitmap.Config.ARGB_8888, false)
-                        if (sw != null) score = hintScore(sw)
+                        if (sw != null) score = matchHint(sw)
                     } catch (e: Exception) {
                         Log.w(TAG, "截图分析失败: ${e.message}")
                     } finally {
@@ -659,6 +700,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
     // ==================== 短剧信息提取 ====================
 
     private fun extractDramaInfo(texts: List<String>) {
+        var bestTitle: String? = null
+        var bestRank = -1
         for (text in texts) {
             val trimmed = text.trim()
             if (trimmed.isEmpty()) continue
@@ -671,26 +714,48 @@ class AdSkipAccessibilityService : AccessibilityService() {
                 }
             }
 
-            // 检测短剧标题（通常较长，包含短剧名称关键词）
-            // 排除按钮文字和广告文字
-            if (trimmed.length >= 4 && trimmed.length <= 30 &&
-                !isAdKeyword(trimmed) &&
-                !RE_INT.matches(trimmed) &&
+            // 检测短剧标题（rank 制：结构命中的候选优先于普通文本）
+            // 1) 用户内容/平台装饰一律不算剧名（热评、展开、声明、[ 表情、回复、点赞、已完结/全N集）
+            if (trimmed.contains("[") || trimmed.contains("热评") || trimmed.contains("展开") ||
+                trimmed.contains("声明") || trimmed.contains("回复") || trimmed.contains("点赞") ||
+                RE_FINISHED.containsMatchIn(trimmed)
+            ) continue
+            if (isAdKeyword(trimmed)) continue
+            if (RE_INT.matches(trimmed) || RE_CLOCK.matches(trimmed) || RE_CLOCK3.matches(trimmed)) continue
+
+            // 2) 「第4集 | 闺蜜沈妩和许茵…」卡片：取竖线后的部分作为标题
+            RE_TITLE_PIPE.find(trimmed)?.let { m ->
+                val candidate = m.groupValues[1].trim()
+                if (candidate.length in 4..40 &&
+                    (bestRank < 3 || (bestRank == 3 && candidate.length > (bestTitle?.length ?: 0)))) {
+                    bestTitle = candidate
+                    bestRank = 3
+                }
+                return@let
+            }
+            // 3) 含「第X季」的完整剧名（班般的甜蜜爱情第一季）
+            if (trimmed.length in 4..40 && RE_TITLE_SEASON.matches(trimmed)) {
+                if (bestRank < 3 || (bestRank == 3 && trimmed.length > (bestTitle?.length ?: 0))) {
+                    bestTitle = trimmed
+                    bestRank = 3
+                }
+                continue
+            }
+            // 4) 普通正文候选（排除按钮文字和广告文字）
+            if (trimmed.length in 4..30 &&
                 !trimmed.contains("免费") &&
                 !trimmed.contains("下载") &&
                 !trimmed.contains("打开") &&
                 // 红果的「（番茄）微短剧备字（2026）第072837号」备案号比标题长，会把标题顶掉
-                !trimmed.contains("备字") &&
-                !RE_CLOCK.matches(trimmed) &&
-                !RE_CLOCK3.matches(trimmed)
+                !trimmed.contains("备字")
             ) {
-                // 可能是短剧标题
-                if (dramaTitle == "未检测到" || trimmed.length > dramaTitle.length) {
-                    // 优先取较长的文字作为标题（标题通常比集数长）
-                    dramaTitle = trimmed
+                if (bestRank < 1 || (bestRank == 1 && trimmed.length > (bestTitle?.length ?: 0))) {
+                    bestTitle = trimmed
+                    bestRank = 1
                 }
             }
         }
+        bestTitle?.let { dramaTitle = it }
     }
 
     private fun isAdKeyword(text: String): Boolean {
