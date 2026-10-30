@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
-  "name": "跳跳狐 · B站广告跳过",
-  "version": "0.1.0",
-  "version_name": "0.1.0",
-  "description": "按社区标注跳过 B 站视频内嵌的恰饭片段，跳过后 3 秒内可撤回。与跳跳狐 App 同一套数据源与落点规则。",
+  "name": "跳跳狐 · 视频广告跳过",
+  "version": "0.2.0",
+  "version_name": "0.2.0",
+  "description": "跳过 B 站视频内嵌的恰饭片段（跳过后 3 秒内可撤回），并自动切走抖音网页版信息流里的广告。与跳跳狐 App 同一套落点规则。",
   "permissions": ["storage"],
   "host_permissions": [
     "https://bsbsb.top/*",
@@ -29,6 +29,12 @@
       "js": ["main-world.js"],
       "world": "MAIN",
       "run_at": "document_start"
+    },
+    {
+      "matches": ["https://www.douyin.com/*", "https://douyin.com/*"],
+      "js": ["douyin.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle"
     }
   ]
 }
