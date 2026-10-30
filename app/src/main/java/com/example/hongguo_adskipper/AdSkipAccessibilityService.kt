@@ -572,14 +572,14 @@ class AdSkipAccessibilityService : AccessibilityService() {
         var best = -1f
         for (t in templates) {
             if (grows - t.rows < 0 || gcols - t.cols < 0) continue
-            // 粗搜：cell 网格滑动
+            // 粗搜：cell 网格滑动（复用数组避免反复分配）
             var tBest = -1f
             var bestCx = 0
             var bestCy = 0
+            val a = FloatArray(t.cells.size)
             for (gy in 0..(grows - t.rows)) {
                 val rowBase = gy * gcols
                 for (gx in 0..(gcols - t.cols)) {
-                    val a = FloatArray(t.cells.size)
                     var i = 0
                     for (r in 0 until t.rows) {
                         val base = rowBase + r * gcols + gx
@@ -593,18 +593,43 @@ class AdSkipAccessibilityService : AccessibilityService() {
                     }
                 }
             }
-            // 精搜：像素 ±cell（NCC 对 1-2px 位移敏感，粗搜网格可能错过精确位置）
+            // 精搜：像素 ±cell（NCC 对 1-2px 位移敏感，粗搜网格可能错过精确位置）。
+            // 性能关键：扩展区域（模板+2*cell 边距）只 getPixel 一次，81 个候选从内存数组滑窗取，
+            // 避免每个候选重读模板区域（否则每拍 400 万次 getPixel，真机 2-3s）。
             val px0 = x0 + bestCx * cell
             val py0 = y0 + bestCy * cell
+            val ex0 = maxOf(0, px0 - cell)
+            val ey0 = maxOf(0, py0 - cell)
+            val ex1 = minOf(sw, px0 + cell + t.w)
+            val ey1 = minOf(sh, py0 + cell + t.h)
+            val ew = ex1 - ex0
+            val eh = ey1 - ey0
+            if (ew <= 0 || eh <= 0) continue
+            val bits = BooleanArray(ew * eh)
+            for (y in 0 until eh) for (x in 0 until ew) {
+                bits[y * ew + x] = luminance(bmp.getPixel(ex0 + x, ey0 + y)) > 150
+            }
+            val cells = FloatArray(t.rows * t.cols)
             for (dy in -cell..cell) {
                 for (dx in -cell..cell) {
                     val cx = px0 + dx
                     val cy = py0 + dy
-                    if (cx < 0 || cy < 0 || cx + t.w > sw || cy + t.h > sh) continue
-                    val a = cellsOf(t.w, t.h, cell) { ox, oy ->
-                        luminance(bmp.getPixel(cx + ox, cy + oy)) > 150
+                    if (cx < ex0 || cy < ey0 || cx + t.w > ex1 || cy + t.h > ey1) continue
+                    for (r in 0 until t.rows) {
+                        val yy0 = r * t.h / t.rows
+                        val yy1 = maxOf(yy0 + 1, (r + 1) * t.h / t.rows)
+                        for (c in 0 until t.cols) {
+                            val xx0 = c * t.w / t.cols
+                            val xx1 = maxOf(xx0 + 1, (c + 1) * t.w / t.cols)
+                            var hit = 0
+                            for (y in yy0 until yy1) for (x in xx0 until xx1) {
+                                if (bits[(y + cy - ey0) * ew + (x + cx - ex0)]) hit++
+                            }
+                            cells[r * t.cols + c] =
+                                hit.toFloat() / ((yy1 - yy0) * (xx1 - xx0))
+                        }
                     }
-                    val s = ncc(a, t.cells)
+                    val s = ncc(cells, t.cells)
                     if (s > best) best = s
                 }
             }
