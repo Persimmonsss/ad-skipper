@@ -5,6 +5,13 @@
         <item name="colorPrimaryVariant">@color/primary_variant</item>
         <item name="colorSecondary">@color/accent</item>
         <item name="colorSecondaryVariant">@color/accent_variant</item>
+        <!-- 显式指定容器色，避免 Material3 回退到默认紫罗兰 -->
+        <item name="colorPrimaryContainer">#FFE8D5</item>
+        <item name="colorOnPrimaryContainer">#6B3A0A</item>
+        <item name="colorSecondaryContainer">#D6F0E8</item>
+        <item name="colorOnSecondaryContainer">#0A3D33</item>
+        <item name="colorOnPrimary">#FFFFFFFF</item>
+        <item name="colorOnSecondary">#FFFFFFFF</item>
         <item name="android:colorBackground">@color/bg</item>
         <item name="android:statusBarColor">@color/bg</item>
         <item name="android:windowLightStatusBar">true</item>
