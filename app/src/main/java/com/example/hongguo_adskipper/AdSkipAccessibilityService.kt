@@ -60,7 +60,9 @@ class AdSkipAccessibilityService : AccessibilityService() {
         // 抖音信息流只在明确的「广告」角标上出手，CTA 单独出现不算
         private val DOUYIN_AD_BADGE = Regex("""^(广告|廣告|赞助|贊助|推广|推廣)(\s*[·|｜].*)?$""")
 
-        private const val CHECK_INTERVAL_MS = 2000L
+        // 轮询：目标 App（红果/抖音等）前台 1.2s 高频兜底；其他前台 5s 低频（省电大头）
+        private const val CHECK_INTERVAL_ACTIVE_MS = 1200L
+        private const val CHECK_INTERVAL_IDLE_MS = 5000L
 
         // 轮询里反复用到，预编译避免每次检测都新建正则
         private val RE_BARE_DIGIT = Regex("""^\d{1,2}$""")
@@ -87,8 +89,17 @@ class AdSkipAccessibilityService : AccessibilityService() {
         private const val HINT_CELL = 4
         private const val HINT_SCORE = 0.85f
         private const val HINT_STREAK_NEED = 2
-        private const val HINT_SAMPLE_MS = 2000L
+        // 红果采样间隔两档：有广告迹象（提示条近似/命中）1.2s 高频确认；正常播放 3s 低频（省电）
+        private const val HINT_SAMPLE_HOT_MS = 1200L
+        private const val HINT_SAMPLE_COOL_MS = 3000L
+        // 连续 N 拍毫无广告迹象后从高频回到低频
+        private const val HINT_COOL_STREAK_RESET = 3
         private const val SHOT_MIN_GAP_MS = 1200L
+        // 红果跳过后的撤回气泡停留时长
+        private const val UNDO_BUBBLE_MS = 5000L
+        // 倒计时锁定广告：复核失败后的快速重试间隔与上限（前 3 次 0.8s，后 2 次 2.4s，覆盖 10s+ 倒计时）
+        private const val RETRY_DELAY_MS = 800L
+        private const val LOCK_RETRY_MAX = 5
 
         // 开屏广告：应用切到前台后的检测窗口
         private const val SPLASH_WINDOW_MS = 10000L
@@ -103,14 +114,21 @@ class AdSkipAccessibilityService : AccessibilityService() {
         // 「关闭」类文案太常见：B站视频页的「关闭弹幕」就被当成开屏按钮点过
         private val SKIP_CONTAINS_EXCLUDE = listOf(
             "弹窗", "提示", "引导", "通知", "弹幕", "倍速", "投屏", "清晰度",
-            "全屏", "连播", "收藏", "分享", "下载", "评论", "客服", "字幕", "悬浮"
+            "全屏", "连播", "收藏", "分享", "下载", "评论", "客服", "字幕", "悬浮",
+            // 系统控制中心/通知栏的开关描述（如「飞行模式,关闭」）绝不能当跳过键点
+            "飞行", "模式", "蓝牙", "Wi-Fi", "wifi", "WLAN", "热点", "静音",
+            "震动", "勿扰", "护眼", "深色", "亮度", "旋转", "数据", "流量",
+            "同步", "省电", "电池", "自动"
         )
         // 只有出现在右上/右下角的纯数字才算倒计时按钮（美团类开屏常见）
         private val SKIP_COUNTDOWN = Regex("""^(跳过\s*)?\d{1,2}\s*[sS秒]?$""")
         private val SPLASH_AD_WORDS = listOf("广告", "廣告", "赞助", "投诉", "摇一摇", "摇动手机", "跳转第三方")
         private val SPLASH_SKIP_PKGS = listOf(
             "com.android.systemui", "com.android.launcher", "com.android.settings",
-            "com.phoenix.read", "com.miui.home", "com.miui.personalassistant"
+            "com.phoenix.read", "com.miui.home", "com.miui.personalassistant",
+            // 系统 UI/安全中心：通知栏、控制中心、系统弹窗不是开屏广告，绝不能扫更不能点
+            "miui.systemui.plugin", "com.miui.systemui", "com.miui.securitycenter",
+            "com.miui.rom", "com.android.providers.media"
         )
 
         // ========== 统计数据 ==========
@@ -163,6 +181,16 @@ class AdSkipAccessibilityService : AccessibilityService() {
     }
 
     private val biliBubble by lazy { SkipBubble(this) }
+    // 红果剧间广告「跳过」后的撤回气泡（复用 SkipBubble，悬浮窗权限即可）
+    private val undoBubble by lazy { SkipBubble(this) }
+    private var undoUuid = 0L
+    private var undoUntil = 0L
+    // 倒计时锁定型广告的快速重试状态（复核失败时进入，成功或放弃后退出）
+    private var retryingAd = false
+    private var lockRetries = 0
+    // 红果采样两档：有广告迹象时高频，正常播放回低频省电
+    private var hintHot = false
+    private var hintCoolStreak = 0
     private val biliUi by lazy { BiliUiSkip(this, biliBubble) }
 
     // 前台包名：红果不在前台时不做轮询（省电）
@@ -176,7 +204,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
             } catch (e: Exception) {
                 logDebug("定时检测异常: ${e.message}")
             }
-            handler.postDelayed(this, CHECK_INTERVAL_MS)
+            handler.postDelayed(this, if (foregroundPkg in TARGET_PACKAGES) CHECK_INTERVAL_ACTIVE_MS else CHECK_INTERVAL_IDLE_MS)
         }
     }
 
@@ -220,7 +248,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
         showNotification()
         handler.removeCallbacks(periodicCheck)
         handler.removeCallbacks(biliTicker)
-        handler.postDelayed(periodicCheck, CHECK_INTERVAL_MS)
+        handler.postDelayed(periodicCheck, if (foregroundPkg in TARGET_PACKAGES) CHECK_INTERVAL_ACTIVE_MS else CHECK_INTERVAL_IDLE_MS)
         if (foregroundPkg == BiliUiSkip.BILI_PKG) ensureBiliTicker()
         logDebug("服务已启动 $notificationTitle")
     }
@@ -328,14 +356,13 @@ class AdSkipAccessibilityService : AccessibilityService() {
         // 刚切走 App 的残留事件不能算数，否则别的 App 启动瞬间会误滑
         if (pkg != foregroundPkg) return
         val currentTime = System.currentTimeMillis()
-        if (!canSwipeNow(currentTime)) return
         val rootNode = activeWindowRoot() ?: return
         // 事件可能来自刚切走的 App，活动窗口必须仍是事件来源
         if (rootNode.packageName?.toString() != pkg) return
         processScreen(rootNode, currentTime)
     }
 
-    /** 滑动节流 + 连续滑动预算：事件入口与轮询入口共用，避免两处口径漂移。 */
+    /** 滑动节流 + 连续滑动预算：命中后统一在 onAdDetected 里检查，避免事件驱动下重复滑动。 */
     private fun canSwipeNow(now: Long): Boolean {
         if (now - lastSwipeTime < SWIPE_DELAY_MS) return false
         if (consecutiveSwipes >= MAX_CONSECUTIVE_SWIPES) {
@@ -376,7 +403,6 @@ class AdSkipAccessibilityService : AccessibilityService() {
         // 启动切换瞬间根窗口可能还是上一个 App，必须与前台包名一致才处理
         if (packageName != foregroundPkg) return
         val currentTime = System.currentTimeMillis()
-        if (!canSwipeNow(currentTime)) return
         processScreen(rootNode, currentTime)
     }
 
@@ -424,22 +450,35 @@ class AdSkipAccessibilityService : AccessibilityService() {
 
         // 3. 检测广告
         val pkg = rootNode.packageName?.toString().orEmpty()
-        if (pkg in HONGGUO_PACKAGES && currentTime - lastHintSampleAt >= HINT_SAMPLE_MS) {
+        // 倒计时重试循环进行中：红果还在同一广告页，轮询不再重复触发（避免耗尽连续滑动预算）
+        if (retryingAd) return
+        if (pkg in HONGGUO_PACKAGES && currentTime - lastHintSampleAt >= if (hintHot) HINT_SAMPLE_HOT_MS else HINT_SAMPLE_COOL_MS) {
             // 红果剧间广告画在自家窗口里，无障碍树原样留着上一集的 60 多条文案
             //（实测：「第12集/选集/评论」全在，广告自身一个字都不进树），文字判定必然误伤。
             // 唯一稳定的画面标记是广告层底部的「上滑继续看短剧」提示，按模板匹配认它。
             lastHintSampleAt = currentTime
             sampleScreenMatch { score ->
                 if (score >= HINT_SCORE) {
+                    hintHot = true
                     hintStreak++
                     logDebug("提示条匹配 ${(score * 100).toInt()}% 第${hintStreak}拍")
                     if (hintStreak >= HINT_STREAK_NEED) {
                         hintStreak = 0
                         onAdDetected("上滑继续看短剧", System.currentTimeMillis())
                     }
+                } else if (score >= 0.6f) {
+                    // 有广告迹象但未达阈值：进入高频，等它变清晰
+                    hintHot = true
+                    hintCoolStreak = 0
+                    hintStreak = 0
+                    logDebug("提示条近似 ${(score * 100).toInt()}%")
                 } else {
                     hintStreak = 0
-                    if (score >= 0.6f) logDebug("提示条近似 ${(score * 100).toInt()}%")
+                    hintCoolStreak++
+                    if (hintCoolStreak >= HINT_COOL_STREAK_RESET) {
+                        hintCoolStreak = 0
+                        hintHot = false
+                    }
                 }
             }
         }
@@ -463,6 +502,11 @@ class AdSkipAccessibilityService : AccessibilityService() {
 
     /** 命中广告后的统一动作：计数、记日志、延迟上滑、再复核。 */
     private fun onAdDetected(keyword: String, currentTime: Long) {
+        // 滑动节流 + 连续预算统一在这里拦截（事件驱动下入口不再前置，防止同一广告反复滑动）
+        if (!canSwipeNow(currentTime)) {
+            logDebug("广告命中但滑动被节流拦截")
+            return
+        }
         lastAdKeyword = keyword
         adDetectedCount++
         hintStreak = 0
@@ -479,6 +523,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
         handler.postDelayed({
             if (performSwipeUp()) {
                 logDebug("已执行滑动 第${consecutiveSwipes}次")
+                showUndoBubble(consecutiveSwipes.toLong())
                 // 延迟后再检查一次，判断是否成功跳过
                 handler.postDelayed({
                     checkSwipeResult()
@@ -487,6 +532,47 @@ class AdSkipAccessibilityService : AccessibilityService() {
                 logDebug("滑动未执行：红果已不在前台")
             }
         }, AD_WAIT_MS)
+    }
+
+    /** 跳过成功后显示撤回气泡（可关）：跳错了点「撤回」反向下滑回到上一状态。 */
+    private fun showUndoBubble(swipeNo: Long) {
+        if (!Settings.bubbleEnabled) return
+        undoUuid = swipeNo
+        undoUntil = SystemClock.elapsedRealtime() + UNDO_BUBBLE_MS
+        undoBubble.show("已跳过广告", "撤回") { undoLastSwipe(swipeNo) }
+        handler.postDelayed({
+            if (undoUuid == swipeNo && SystemClock.elapsedRealtime() >= undoUntil) {
+                undoUuid = 0
+                undoUntil = 0
+                undoBubble.hide()
+            }
+        }, UNDO_BUBBLE_MS + 60)
+    }
+
+    /** 撤回：反向下滑（红果「上滑跳广告」，反向即回上一状态）。出手前核对前台仍是红果。 */
+    private fun undoLastSwipe(swipeNo: Long) {
+        if (undoUuid != swipeNo || SystemClock.elapsedRealtime() > undoUntil) {
+            undoBubble.hide()
+            return
+        }
+        undoUuid = 0
+        undoUntil = 0
+        undoBubble.hide()
+        if (!screenOn()) return
+        if (!TARGET_PACKAGES.contains(activeWindowPackage())) return
+        val metrics = resources.displayMetrics
+        val path = Path().apply {
+            moveTo(metrics.widthPixels / 2f, metrics.heightPixels * 0.3f)
+            lineTo(metrics.widthPixels / 2f, metrics.heightPixels * 0.7f)
+        }
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0, 300L))
+            .build()
+        dispatchGesture(gesture, object : GestureResultCallback() {
+            override fun onCompleted(gd: GestureDescription?) { Log.d(TAG, "撤回滑动完成") }
+            override fun onCancelled(gd: GestureDescription?) { Log.w(TAG, "撤回滑动取消") }
+        }, null)
+        logDebug("已执行撤回滑动")
     }
 
     // ==================== 红果剧间广告：提示条模板匹配 ====================
@@ -713,9 +799,38 @@ class AdSkipAccessibilityService : AccessibilityService() {
             val stillAd = score >= HINT_SCORE
             if (stillAd) {
                 adSkipFailCount++
-                logDebug("滑动可能失败，提示条还在 ${(score * 100).toInt()}%")
+                // 倒计时锁定型广告：红果开头锁定上滑（x 秒后可划），首滑无效是正常的。
+                // 复核失败进入快速重试循环（绕过 3 秒节流），倒计时一结束立即划走。
+                if (!retryingAd) {
+                    retryingAd = true
+                    lockRetries = 0
+                    logDebug("滑动可能失败，进入倒计时重试（提示条 ${(score * 100).toInt()}%）")
+                }
+                if (lockRetries < LOCK_RETRY_MAX) {
+                    lockRetries++
+                    val delay = if (lockRetries <= 3) RETRY_DELAY_MS else RETRY_DELAY_MS * 3
+                    logDebug("锁定重试 第${lockRetries}次（${delay}ms 后）")
+                    handler.postDelayed({
+                        if (screenOn() && TARGET_PACKAGES.contains(activeWindowPackage())) {
+                            if (performSwipeUp()) {
+                                showUndoBubble(lockRetries.toLong())
+                                handler.postDelayed({ checkSwipeResult() }, 2000)
+                            } else {
+                                retryingAd = false
+                            }
+                        } else {
+                            retryingAd = false
+                        }
+                    }, delay)
+                } else {
+                    retryingAd = false
+                    lockRetries = 0
+                    logDebug("倒计时重试 ${LOCK_RETRY_MAX} 次仍失败，放弃，交给轮询")
+                }
             } else {
                 adSkipSuccessCount++
+                retryingAd = false
+                lockRetries = 0
                 logDebug("滑动成功，已离开广告")
             }
             sendStatsBroadcast()
@@ -941,8 +1056,11 @@ class AdSkipAccessibilityService : AccessibilityService() {
         // 继续按坐标盲点会点到当前页面（实测点掉过 B站 的“取消”）
         val active = activeWindowPackage().takeIf { it.isNotBlank() }
         if (active != pkg) {
-            if (active != null && splashNodeClicks > 0) {
-                logDebug("开屏点完已切到 $active，停止扫描")
+            // 红果等目标 App 已在前台时无条件停止开屏扫描：红果剧间广告的
+            // 截图匹配/滑动调度与开屏轮询共用主线程，开屏轮询不退出会
+            // 阻塞「命中后延迟滑动」的执行（实测 21:12 命中后滑动未执行）。
+            if (active != null && (splashNodeClicks > 0 || TARGET_PACKAGES.contains(active))) {
+                logDebug("开屏扫描停止(active=$active)")
                 handler.removeCallbacks(splashTicker)
             }
             return
