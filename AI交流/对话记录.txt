@@ -1258,7 +1258,7 @@ D2 在最终包上 PASS。再补「息屏 0 扫描」这条红线：让 B站 在
 | D2 退出重进再跳 | commit `d17c717`；真机 `%TEMP%\d2_final3.log`：21:32:59 第一次跳 → BACK×2 重进 → 21:33:08 重新解析 → **21:34:05 同一广告段第二次自动跳**，FATAL 0 |
 | 随机回归（用户规矩） | `%TEMP%\regr_v12.log` 抽到 BV1njnn6yEMY：跳过偏差 1s、撤回落点 371s（期望 370s）、4b 观察 150s 读数 398→532 穿过广告尾 476s、**二次跳过 0 次**、单进程 31633、FATAL 0；`regr_v13.log` 同链路再 PASS 一次 |
 | 崩溃防护 | `logcat -b crash` 对本包 **0 命中**，无 `ANR in com.example.hongguo_adskipper` |
-| README + 协作板 | commit `16efdcf` `f4bdd5e` `9ef36f7` |
+| README + 协作板 | commit `16efdcf` `6411229` `b8164cf` |
 
 ## 红线逐项实测
 
@@ -1290,7 +1290,7 @@ D2 在最终包上 PASS。再补「息屏 0 扫描」这条红线：让 B站 在
 
 - 包：`C:\Users\Persimmon\Desktop\跳广告工具\ad-skipper-v2.1.2.apk`（md5 `ff022e39a4cc50cf799f949f1d3a4496`）；旧包已归档到 `旧包\`
 - 装机四步：无障碍 → 通知使用权 → 悬浮窗 → 电池优化「无限制」+ 自启动（**覆盖安装后悬浮窗必被 MIUI 重置**，本轮 v11 假 FAIL 就是这么来的）
-- 本地 6 个 commit：`7a60f6b` `d17c717` `a3308ab` `669fd63` `16efdcf` `f4bdd5e` `9ef36f7`，工作区干净
+- 本地 docs/fix commit（push 前为脱敏内网地址重写过一次历史，hash 有变）：`7a60f6b` `d17c717` `a3308ab` `669fd63` `16efdcf` `6411229` `b8164cf`，工作区干净
 
 **要 push 到 origin/main 吗？** 另外提醒：`AI交流/` 里写了内网 adb 地址（<内网 adb 地址·已脱敏>）和设备序列号，推之前建议先脱敏。
 
