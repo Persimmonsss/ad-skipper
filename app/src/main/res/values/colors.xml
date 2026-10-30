@@ -1,8 +1,36 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!-- 亲民浅色柔和风：狐狸橘主色 + 青绿点缀，避开紫色系 -->
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
-    <color name="primary">#FF6200EE</color>
-    <color name="primary_variant">#FF3700B3</color>
-    <color name="surface">#FFFFFFFF</color>
+
+    <!-- 主色（狐狸橘） -->
+    <color name="primary">#FFF97316</color>
+    <color name="primary_variant">#FFE26410</color>
+
+    <!-- 强调色（柔和青绿） -->
+    <color name="accent">#FF22A98F</color>
+    <color name="accent_variant">#FF1B8F79</color>
+
+    <!-- 页面背景：暖奶油 -->
+    <color name="bg">#FFFBF6EF</color>
+    <color name="bg_card">#FFFFFFFF</color>
+    <color name="bg_card_stroke">#FFF3E9DC</color>
+    <color name="bg_hero_start">#FFFFF3E4</color>
+    <color name="bg_hero_end">#FFFBF6EF</color>
+
+    <!-- 文字层级 -->
+    <color name="text_primary">#FF3A322A</color>
+    <color name="text_secondary">#FF9B9184</color>
+    <color name="text_hint">#FFC4BAA9</color>
+
+    <!-- 图标背景（取自主图角部色） -->
+    <color name="icon_bg">#FFFEF7F2</color>
+
+    <!-- 状态点 -->
+    <color name="dot_green">#FF34C759</color>
+    <color name="dot_orange">#FFFF9F0A</color>
+    <color name="dot_gray">#FFC7BEB2</color>
+
+    <color name="surface">#FFFBF6EF</color>
 </resources>

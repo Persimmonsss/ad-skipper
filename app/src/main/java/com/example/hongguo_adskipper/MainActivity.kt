@@ -5,6 +5,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -12,6 +13,8 @@ import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings as AndroidSettings
+import android.view.SoundEffectConstants
+import android.view.View
 import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
@@ -26,6 +29,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvNls: TextView
     private lateinit var tvOverlay: TextView
     private lateinit var tvBattery: TextView
+    private lateinit var dotA11y: View
+    private lateinit var dotNls: View
+    private lateinit var dotOverlay: View
+    private lateinit var dotBattery: View
     private lateinit var swBili: MaterialSwitch
     private lateinit var swBubble: MaterialSwitch
     private lateinit var swSplash: MaterialSwitch
@@ -33,6 +40,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvBiliState: TextView
     private lateinit var tvStats: TextView
     private lateinit var tvLog: TextView
+    private var audio: AudioManager? = null
 
     private val handler = Handler(Looper.getMainLooper())
     private val refresh = object : Runnable {
@@ -50,6 +58,10 @@ class MainActivity : AppCompatActivity() {
         tvNls = findViewById(R.id.tv_nls_status)
         tvOverlay = findViewById(R.id.tv_overlay_status)
         tvBattery = findViewById(R.id.tv_battery_status)
+        dotA11y = findViewById(R.id.dot_a11y)
+        dotNls = findViewById(R.id.dot_nls)
+        dotOverlay = findViewById(R.id.dot_overlay)
+        dotBattery = findViewById(R.id.dot_battery)
         swBili = findViewById(R.id.sw_bili)
         swBubble = findViewById(R.id.sw_bubble)
         swSplash = findViewById(R.id.sw_splash)
@@ -57,6 +69,7 @@ class MainActivity : AppCompatActivity() {
         tvBiliState = findViewById(R.id.tv_bili_state)
         tvStats = findViewById(R.id.tv_stats)
         tvLog = findViewById(R.id.tv_log)
+        audio = getSystemService(AudioManager::class.java)
         findViewById<TextView>(R.id.tv_version).text = versionLabel()
 
         bindSwitch(swBili) { Settings.biliEnabled = it }
@@ -65,22 +78,33 @@ class MainActivity : AppCompatActivity() {
         bindSwitch(swHongguo) { Settings.hongguoEnabled = it }
 
         findViewById<MaterialButton>(R.id.btn_a11y).setOnClickListener {
+            playClick()
             startActivitySafe(Intent(AndroidSettings.ACTION_ACCESSIBILITY_SETTINGS))
         }
         findViewById<MaterialButton>(R.id.btn_nls).setOnClickListener {
+            playClick()
             startActivitySafe(Intent(AndroidSettings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
         }
         findViewById<MaterialButton>(R.id.btn_overlay).setOnClickListener {
+            playClick()
             startActivitySafe(
                 Intent(AndroidSettings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
             )
         }
-        findViewById<MaterialButton>(R.id.btn_battery).setOnClickListener { requestIgnoreBattery() }
-        findViewById<Button>(R.id.btn_clear_log).setOnClickListener { Stats.clearLogs() }
+        findViewById<MaterialButton>(R.id.btn_battery).setOnClickListener {
+            playClick()
+            requestIgnoreBattery()
+        }
+        findViewById<Button>(R.id.btn_clear_log).setOnClickListener {
+            playClick()
+            Stats.clearLogs()
+        }
         findViewById<MaterialButton>(R.id.btn_open_bili).setOnClickListener {
+            playClick()
             openPackage("tv.danmaku.bili", "未安装 B站")
         }
         findViewById<MaterialButton>(R.id.btn_open_hongguo).setOnClickListener {
+            playClick()
             openPackage("com.phoenix.read", "未安装红果短剧")
         }
 
@@ -106,7 +130,15 @@ class MainActivity : AppCompatActivity() {
             R.id.sw_splash -> Settings.splashEnabled
             else -> Settings.hongguoEnabled
         }
-        s.setOnCheckedChangeListener { _, checked -> onChange(checked) }
+        s.setOnCheckedChangeListener { _, checked ->
+            playClick()
+            onChange(checked)
+        }
+    }
+
+    /** 轻量按键反馈：使用系统自带点击音，不引入额外音频资源。 */
+    private fun playClick() {
+        audio?.playSoundEffect(SoundEffectConstants.CLICK)
     }
 
     private fun render() {
@@ -120,6 +152,11 @@ class MainActivity : AppCompatActivity() {
         val battery = isIgnoringBattery()
         tvBattery.text = if (battery) "电池优化：已加白名单（后台不会被冻结）"
             else "电池优化：未加白名单（MIUI 会冻结后台，服务可能自己掉线）"
+
+        setDot(dotA11y, a11y)
+        setDot(dotNls, nls)
+        setDot(dotOverlay, overlay)
+        setDot(dotBattery, battery)
 
         swBili.isChecked = Settings.biliEnabled
         swBubble.isChecked = Settings.bubbleEnabled
@@ -152,6 +189,11 @@ class MainActivity : AppCompatActivity() {
 
         val logs = Stats.logLines()
         tvLog.text = if (logs.isEmpty()) "等待事件…" else logs.joinToString("\n")
+    }
+
+    /** 状态点：绿=已开启，橙=未开启。 */
+    private fun setDot(dot: View, on: Boolean) {
+        dot.setBackgroundResource(if (on) R.drawable.dot_green else R.drawable.dot_orange)
     }
 
     private fun fmt(ms: Long): String {

@@ -11,8 +11,8 @@ android {
         applicationId = "com.example.hongguo_adskipper"
         minSdk = 24
         targetSdk = 34
-        versionCode = 5
-        versionName = "2.1.2"
+        versionCode = 6
+        versionName = "2.2.0"
     }
 
     buildTypes {
@@ -23,6 +23,11 @@ android {
                 "proguard-rules.pro"
             )
         }
+    }
+
+    lint {
+        // 离线构建环境无 lint 组件缓存，release 不跑 lintVital
+        checkReleaseBuilds = false
     }
 
     compileOptions {
