@@ -271,14 +271,14 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="10dp"
-                android:text="红果剧内广告"
+                android:text="红果 / 抖音 信息流广告"
                 android:textColor="@color/text_primary"
                 android:textSize="14sp" />
 
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="红果短剧检测到广告页时自动上滑"
+                android:text="红果短剧、抖音信息流检测到「广告」标识时自动上滑"
                 android:textColor="@color/text_hint"
                 android:textSize="11sp" />
         </LinearLayout>
@@ -325,7 +325,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="6dp"
-                android:text="省电：只有 B站/红果在前台才读取界面；App 启动后 10 秒内检测开屏，其余时间休眠"
+                android:text="省电：只有 B站/红果/抖音在前台才读取界面；App 启动后 10 秒内检测开屏，其余时间休眠"
                 android:textColor="@color/text_hint"
                 android:textSize="11sp" />
         </LinearLayout>

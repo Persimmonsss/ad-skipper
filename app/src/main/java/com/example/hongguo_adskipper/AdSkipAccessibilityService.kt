@@ -38,18 +38,25 @@ class AdSkipAccessibilityService : AccessibilityService() {
         private const val CHANNEL_ID = "ad_skip_channel"
         private const val NOTIFICATION_ID = 1
 
-        private val TARGET_PACKAGES = listOf(
+        private val HONGGUO_PACKAGES = listOf(
             "com.phoenix.read",
             "com.phoenix.read.tv",
             "cn.xiaochuankeji.zhibo"
         )
+        private const val DOUYIN_PKG = "com.ss.android.ugc.aweme"
+        private val TARGET_PACKAGES = HONGGUO_PACKAGES + DOUYIN_PKG
 
+        // 红包浮层的「立即领取」在红果每集都有，不能算广告线索
         private val AD_KEYWORDS = listOf(
-            "广告", "推广", "AD", "广告剩余",
+            "广告", "推广", "广告剩余",
             "跳过广告", "跳过", "关闭广告",
             "立即下载", "了解更多", "查看详情",
-            "打开应用", "去下载", "领取", "安装"
+            "打开应用", "去下载"
         )
+        // 英文 AD 必须独立成词：download 里的 "ad" 不是广告
+        private val RE_AD_WORD = Regex("""(?i)(^|[^a-z])ad([^a-z]|$)""")
+        // 抖音信息流只在明确的「广告」角标上出手，CTA 单独出现不算
+        private val DOUYIN_AD_BADGE = Regex("""^(广告|廣告|赞助|贊助|推广|推廣)(\s*[·|｜].*)?$""")
 
         private const val CHECK_INTERVAL_MS = 2000L
 
@@ -75,13 +82,29 @@ class AdSkipAccessibilityService : AccessibilityService() {
 
         // 开屏广告：应用切到前台后的检测窗口
         private const val SPLASH_WINDOW_MS = 10000L
+        // 扫到广告特征时续期：不少 App 先播自家启动页，第三方广告 8 秒后才加载
+        private const val SPLASH_RENEW_MS = 8000L
         private const val SPLASH_SCAN_STEP_MS = 300L
         private const val SPLASH_CLICK_CD_MS = 1000L
-        private const val SPLASH_MAX_CLICKS = 2
+        // 节点点击与盲点各记各的预算：前两次空扫不能把额度花光，真广告常常 8 秒后才加载
+        private const val SPLASH_NODE_MAX = 2
         private val SKIP_LABEL = Regex("""(?i)^(跳过|跳過|关闭|關閉|skip|close)(广告|廣告)?(\s*\d+\s*[s秒]?)?$""")
-        private const val SPLASH_SKIP_PKGS =
-            "com.android.systemui,com.android.launcher,com.android.settings,com.phoenix.read," +
-                    "com.miui.home,com.miui.personalassistant"
+        private val SKIP_CONTAINS = listOf("跳过", "跳過", "关闭", "關閉", "skip", "close")
+        // 「关闭」类文案太常见：B站视频页的「关闭弹幕」就被当成开屏按钮点过
+        private val SKIP_CONTAINS_EXCLUDE = listOf(
+            "弹窗", "提示", "引导", "通知", "弹幕", "倍速", "投屏", "清晰度",
+            "全屏", "连播", "收藏", "分享", "下载", "评论", "客服", "字幕", "悬浮"
+        )
+        // 只有出现在右上/右下角的纯数字才算倒计时按钮（美团类开屏常见）
+        private val SKIP_COUNTDOWN = Regex("""^(跳过\s*)?\d{1,2}\s*[sS秒]?$""")
+        private val SPLASH_AD_WORDS = listOf("广告", "廣告", "赞助", "投诉", "摇一摇", "摇动手机", "跳转第三方")
+        private val SPLASH_SKIP_PKGS = listOf(
+            "com.android.systemui", "com.android.launcher", "com.android.settings",
+            "com.phoenix.read", "com.miui.home", "com.miui.personalassistant"
+        )
+        // isValidAdText 每次命中都要查，别在检测热路径里现建集合
+        private val AD_STRONG_WORDS = setOf("广告", "推广", "跳过广告", "关闭广告", "广告剩余")
+        private val AD_CTA_WORDS = setOf("立即下载", "去下载", "打开应用", "查看详情", "了解更多")
 
         // ========== 统计数据 ==========
         var isServiceEnabled = false
@@ -293,18 +316,21 @@ class AdSkipAccessibilityService : AccessibilityService() {
         // 刚切走 App 的残留事件不能算数，否则别的 App 启动瞬间会误滑
         if (pkg != foregroundPkg) return
         val currentTime = System.currentTimeMillis()
-        if (currentTime - lastSwipeTime < SWIPE_DELAY_MS) return
-        if (consecutiveSwipes >= MAX_CONSECUTIVE_SWIPES) {
-            if (currentTime - lastAdDetectedTime > RESET_TIMEOUT_MS) consecutiveSwipes = 0
-            else return
-        }
+        if (!canSwipeNow(currentTime)) return
         val rootNode = activeWindowRoot() ?: return
         // 事件可能来自刚切走的 App，活动窗口必须仍是事件来源
         if (rootNode.packageName?.toString() != pkg) return
-        try {
-            processScreen(rootNode, currentTime, fromEvent = true)
-        } finally {
+        processScreen(rootNode, currentTime)
+    }
+
+    /** 滑动节流 + 连续滑动预算：事件入口与轮询入口共用，避免两处口径漂移。 */
+    private fun canSwipeNow(now: Long): Boolean {
+        if (now - lastSwipeTime < SWIPE_DELAY_MS) return false
+        if (consecutiveSwipes >= MAX_CONSECUTIVE_SWIPES) {
+            if (now - lastAdDetectedTime <= RESET_TIMEOUT_MS) return false
+            consecutiveSwipes = 0
         }
+        return true
     }
 
     // ==================== 定时轮询 ====================
@@ -338,17 +364,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
         // 启动切换瞬间根窗口可能还是上一个 App，必须与前台包名一致才处理
         if (packageName != foregroundPkg) return
         val currentTime = System.currentTimeMillis()
-        if (currentTime - lastSwipeTime < SWIPE_DELAY_MS) {
-            return
-        }
-        if (consecutiveSwipes >= MAX_CONSECUTIVE_SWIPES) {
-            if (currentTime - lastAdDetectedTime > RESET_TIMEOUT_MS) consecutiveSwipes = 0
-            else { return }
-        }
-        try {
-            processScreen(rootNode, currentTime, fromEvent = false)
-        } finally {
-        }
+        if (!canSwipeNow(currentTime)) return
+        processScreen(rootNode, currentTime)
     }
 
     /** 息屏后不再读取界面节点，省电。 */
@@ -381,20 +398,21 @@ class AdSkipAccessibilityService : AccessibilityService() {
 
     // ==================== 核心处理：采集 + 检测广告 ====================
 
-    private fun processScreen(rootNode: AccessibilityNodeInfo, currentTime: Long, fromEvent: Boolean) {
+    private fun processScreen(rootNode: AccessibilityNodeInfo, currentTime: Long) {
         screenCheckCount++
         hongguoDetectedCount++
 
         // 1. 采集屏幕所有文字
         val allTexts = mutableListOf<String>()
         collectAllTexts(rootNode, allTexts, 0, 15)
-        lastScreenTexts = allTexts.toList()
+        lastScreenTexts = allTexts
 
         // 2. 提取短剧信息
         extractDramaInfo(allTexts)
 
         // 3. 检测广告
-        val detected = detectAd(rootNode, allTexts)
+        val pkg = rootNode.packageName?.toString().orEmpty()
+        val detected = detectAdFor(pkg, rootNode, allTexts)
         if (detected) {
             adDetectedCount++
             lastAdDetectedTime = currentTime
@@ -450,7 +468,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
         val allTexts = mutableListOf<String>()
         collectAllTexts(rootNode, allTexts, 0, 15)
 
-        val stillAd = detectAd(rootNode, allTexts)
+        // 复核必须和检测用同一套口径，否则抖音跳完会被判成「仍在广告页面」
+        val stillAd = detectAdFor(packageName, rootNode, allTexts)
         if (stillAd) {
             adSkipFailCount++
             logDebug("滑动可能失败，仍在广告页面")
@@ -505,6 +524,10 @@ class AdSkipAccessibilityService : AccessibilityService() {
 
     // ==================== 广告检测 ====================
 
+    /** 红果用宽启发式；抖音只认明确的「广告」角标，宽关键词表会误判普通视频。 */
+    private fun detectAdFor(pkg: String, node: AccessibilityNodeInfo, allTexts: List<String>): Boolean =
+        if (pkg == DOUYIN_PKG) detectDouyinAd(allTexts) else detectAd(node, allTexts)
+
     private fun detectAd(node: AccessibilityNodeInfo, allTexts: List<String>): Boolean {
         if (allTexts.isEmpty()) return false
 
@@ -512,6 +535,10 @@ class AdSkipAccessibilityService : AccessibilityService() {
         for (text in allTexts) {
             val trimmed = text.trim()
             if (trimmed.isEmpty()) continue
+            if (trimmed.length <= 10 && RE_AD_WORD.containsMatchIn(trimmed)) {
+                lastAdKeyword = "\"$trimmed\"→AD"
+                return true
+            }
             for (keyword in AD_KEYWORDS) {
                 if (trimmed.contains(keyword, ignoreCase = true)) {
                     if (isValidAdText(trimmed, keyword)) {
@@ -542,6 +569,18 @@ class AdSkipAccessibilityService : AccessibilityService() {
         return false
     }
 
+    private fun detectDouyinAd(allTexts: List<String>): Boolean {
+        for (text in allTexts) {
+            val trimmed = text.trim()
+            if (trimmed.length > 8) continue
+            if (DOUYIN_AD_BADGE.matches(trimmed)) {
+                lastAdKeyword = "角标\"$trimmed\""
+                return true
+            }
+        }
+        return false
+    }
+
     private fun collectAllTexts(node: AccessibilityNodeInfo, result: MutableList<String>, depth: Int, maxDepth: Int) {
         if (depth > maxDepth) return
         node.text?.let { val s = it.toString().trim(); if (s.isNotEmpty()) result.add(s) }
@@ -553,13 +592,10 @@ class AdSkipAccessibilityService : AccessibilityService() {
     }
 
     private fun isValidAdText(text: String, keyword: String): Boolean {
-        if (keyword in listOf("广告", "推广", "跳过广告", "关闭广告")) return true
+        if (keyword in AD_STRONG_WORDS) return true
+        // 「跳过」单独出现太宽：短剧标题里的「跳过这集」不是按钮
         if (keyword == "跳过") return text.length <= 8 && !text.contains("集") && !text.contains("话")
-        if (keyword in listOf("立即下载", "去下载", "打开应用", "查看详情", "了解更多", "安装")) return true
-        if (keyword == "AD") return text.length <= 10
-        if (keyword == "广告剩余") return true
-        if (keyword == "领取") return text.length <= 6 || text.contains("奖励") || text.contains("福利")
-        return false
+        return keyword in AD_CTA_WORDS
     }
 
     private fun matchesAdCountdown(text: String): Boolean {
@@ -633,11 +669,14 @@ class AdSkipAccessibilityService : AccessibilityService() {
     private var splashPkg: String? = null
     private var splashWindowStart = 0L
     private var splashUntil = 0L
-    private var splashClickCount = 0
-    private var splashSamples = 0
-    private var splashCornerClicks = 0
+    private var splashAdStreak = 0
+    private var splashNodeClicks = 0
     private var lastSplashClick = 0L
     private var lastSplashScan = 0L
+    private var splashTreeLogs = 0
+    private var lastSplashDigest = ""
+    private var splashMatchInfo = ""
+    private var lastSplashClickKey = ""
 
     /** 开屏窗口出现后独立轮询若干秒：广告窗口常常不产生无障碍事件。 */
     private val splashTicker = object : Runnable {
@@ -657,19 +696,27 @@ class AdSkipAccessibilityService : AccessibilityService() {
         if (!Settings.splashEnabled) return
         val pkg = event.packageName?.toString() ?: return
         if (pkg == packageName) return
-        if (SPLASH_SKIP_PKGS.split(",").any { pkg == it || pkg.startsWith("$it.") }) return
+        if (SPLASH_SKIP_PKGS.any { pkg == it || pkg.startsWith("$it.") }) return
         if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
         // 只认 App 切换后的首个窗口，避免在同一个 App 内反复扫描误点普通"关闭"
         if (!appSwitched) return
         val now = SystemClock.elapsedRealtime()
+        // 同一 App 从启动页切到广告页还会来窗口事件：只续期，不重置预算，
+        // 否则盲点额度被刷回来，会在广告上反复点
+        if (pkg == splashPkg && now < splashUntil) {
+            splashUntil = maxOf(splashUntil, now + SPLASH_WINDOW_MS)
+            return
+        }
         splashPkg = pkg
         splashWindowStart = now
         splashUntil = now + SPLASH_WINDOW_MS
-        splashClickCount = 0
-        splashSamples = 0
-        splashCornerClicks = 0
+        splashAdStreak = 0
+        splashNodeClicks = 0
         lastSplashClick = 0
         lastSplashScan = 0
+        splashTreeLogs = 0
+        lastSplashDigest = ""
+        lastSplashClickKey = ""
         handler.removeCallbacks(splashTicker)
         handler.post(splashTicker)
         logDebug("开屏窗口 $pkg")
@@ -679,8 +726,15 @@ class AdSkipAccessibilityService : AccessibilityService() {
         val pkg = splashPkg ?: return
         // 输入法、小窗弹出也会算“应用切换”，此时开屏 App 已不在前台，
         // 继续按坐标盲点会点到当前页面（实测点掉过 B站 的“取消”）
-        if (activeWindowPackage() != pkg) return
-        if (splashClickCount >= SPLASH_MAX_CLICKS) return
+        val active = activeWindowPackage().takeIf { it.isNotBlank() }
+        if (active != pkg) {
+            if (active != null && splashNodeClicks > 0) {
+                logDebug("开屏点完已切到 $active，停止扫描")
+                handler.removeCallbacks(splashTicker)
+            }
+            return
+        }
+        if (splashNodeClicks >= SPLASH_NODE_MAX) return
         if (now - lastSplashClick < SPLASH_CLICK_CD_MS) return
         if (now - lastSplashScan < SPLASH_SCAN_STEP_MS) return
         lastSplashScan = now
@@ -689,8 +743,12 @@ class AdSkipAccessibilityService : AccessibilityService() {
         if (roots.isEmpty()) return
         val node = roots.firstNotNullOfOrNull { findSplashSkipNode(it, 0, 16) }
         if (node != null) {
+            // 同一个键点过一次没反应就不再点：实测连点两下会把用户带进广告落地页
+            val key = "${node.viewIdResourceName}|${node.text}|${node.contentDescription}|${node.className}"
+            if (key == lastSplashClickKey) return
             if (clickNode(node)) {
-                splashClickCount++
+                splashNodeClicks++
+                lastSplashClickKey = key
                 lastSplashClick = SystemClock.elapsedRealtime()
                 Stats.splashClickCount++
                 val label = node.text?.toString()?.take(8)
@@ -699,26 +757,30 @@ class AdSkipAccessibilityService : AccessibilityService() {
                     ?: "?"
                 Stats.splashLastTarget = "${pkg.substringAfterLast('.')}:$label"
                 Stats.log("开屏跳过 ${Stats.splashLastTarget}")
+                logDebug("开屏命中 $splashMatchInfo → 点击 ${node.viewIdResourceName ?: node.className}")
             }
             return
         }
         val samples = roots.flatMap { sampleList(it, 8) }
-        if (splashSamples < 2) {
-            splashSamples++
-            logDebug("开屏树：${samples.joinToString(" / ").take(120)}")
+        val adSurface = looksLikeSplashAd(roots, samples)
+        splashAdStreak = if (adSurface) splashAdStreak + 1 else 0
+        // 广告特征连续两拍才认，避免普通页面里一两个“广告”字样就续期
+        val confirmedAd = splashAdStreak >= 2
+        if (confirmedAd) splashUntil = maxOf(splashUntil, now + SPLASH_RENEW_MS)
+        val digest = samples.joinToString("/")
+        if (digest != lastSplashDigest && splashTreeLogs < 4) {
+            lastSplashDigest = digest
+            splashTreeLogs++
+            logDebug("开屏树：${digest.take(120)}")
             logDebug("开屏窗口数 ${windows.size}：${windowBrief()}")
         }
-        // 兜底：纯图片广告不暴露节点（页面几乎没有文字）时，点右上角常见的跳过位置。
-        // B站 首页/视频页刚加载时也没有文字节点，盲点会误触播放器，故不对 B站 兜底。
-        if (samples.size <= 3 && now - splashWindowStart > 2500 && splashCornerClicks < 2 &&
-            pkg != BiliUiSkip.BILI_PKG
-        ) {
-            splashCornerClicks++
-            splashClickCount++
-            lastSplashClick = now
-            tapAt(0.88f, 0.085f)
-            Stats.log("开屏兜底点击右上角")
-        }
+        // 不再按坐标盲点右上角：实测盲点一次没跳成，反而把用户送进过京东/美团，
+        // 还可能在微信首页点到「+」。纯图片广告（树里连一个节点都没有）只能放弃。
+    }
+
+    private fun looksLikeSplashAd(roots: List<AccessibilityNodeInfo>, samples: List<String>): Boolean {
+        if (samples.any { s -> SPLASH_AD_WORDS.any { s.contains(it) } }) return true
+        return roots.any { hasAdSdkViews(it) }
     }
 
     /** 广告可能挂在独立窗口上，rootInActiveWindow 里看不到。 */
@@ -752,19 +814,6 @@ class AdSkipAccessibilityService : AccessibilityService() {
         return parts.joinToString(",")
     }
 
-    private fun tapAt(fx: Float, fy: Float) {
-        val (w, h) = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val b = getSystemService(WindowManager::class.java).currentWindowMetrics.bounds
-            b.width() to b.height()
-        } else {
-            resources.displayMetrics.let { it.widthPixels to it.heightPixels }
-        }
-        val path = Path().apply { moveTo(w * fx, h * fy) }
-        val gesture = GestureDescription.Builder()
-            .addStroke(GestureDescription.StrokeDescription(path, 0, 60L))
-            .build()
-        dispatchGesture(gesture, null, null)
-    }
 
     private fun findSplashSkipNode(
         node: AccessibilityNodeInfo, depth: Int, maxDepth: Int
@@ -773,8 +822,16 @@ class AdSkipAccessibilityService : AccessibilityService() {
         val text = node.text?.toString()?.trim().orEmpty()
         val desc = node.contentDescription?.toString()?.trim().orEmpty()
         val id = node.viewIdResourceName?.lowercase().orEmpty()
-        if (isSkipLabel(text) || isSkipLabel(desc) || isSkipViewId(id)) {
-            clickableTarget(node)?.let { return it }
+        if (isCornerCountdown(node)) {
+            splashMatchInfo = "倒计时数字「${node.text ?: node.contentDescription}」"
+            return node // 倒计时数字只认它自己可点，往上爬会点到广告或角标容器
+        }
+        if ((isSkipLabel(text) || isSkipLabel(desc)) && isButtonSized(node)) {
+            splashMatchInfo = "text=$text desc=$desc id=$id"
+            return node // 点「跳过」这两个字本身，不去点可点的祖先（实测祖先常是广告容器）
+        }
+        if (isSkipViewId(id) && isButtonSized(node)) {
+            clickableTarget(node)?.let { splashMatchInfo = "id=$id"; return it }
         }
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
@@ -786,14 +843,46 @@ class AdSkipAccessibilityService : AccessibilityService() {
     private fun isSkipLabel(t: String): Boolean {
         val s = t.trim()
         if (s.isEmpty() || s.length > 10) return false
-        return SKIP_LABEL.matches(s) || s.contains("跳过广告") || s.contains("关闭广告")
+        if (SKIP_LABEL.matches(s)) return true
+        // 「5秒后可跳过」「跳过 >」「| 跳过」这类变体整体正则匹配不到，按包含判断补一次
+        if (s.length > 8) return false
+        if (SKIP_CONTAINS_EXCLUDE.any { s.contains(it) }) return false
+        return SKIP_CONTAINS.any { s.contains(it, ignoreCase = true) }
+    }
+
+    /** 美团类开屏的跳过键常常只有一个倒计时数字「2」「2s」，靠位置限定在右上/右下角。 */
+    private fun isCornerCountdown(node: AccessibilityNodeInfo): Boolean {
+        // 必须是按钮本身可点：首页角标（消息未读数）也是右上角的纯数字，但不可点，
+        // 之前按祖先可点往上爬，实测一次点进了京东首页的「消息」「更多菜单」
+        if (!node.isClickable) return false
+        val label = node.text?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+            ?: node.contentDescription?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+            ?: return false
+        if (!SKIP_COUNTDOWN.matches(label)) return false
+        val b = Rect()
+        node.getBoundsInScreen(b)
+        val dm = resources.displayMetrics
+        if (b.height() > dm.heightPixels * 0.12f) return false
+        val rightSide = b.left > dm.widthPixels * 0.55f
+        val topBand = b.top < dm.heightPixels * 0.22f
+        val bottomBand = b.top > dm.heightPixels * 0.7f
+        return rightSide && (topBand || bottomBand)
     }
 
     private fun isSkipViewId(id: String): Boolean {
         if (id.isEmpty()) return false
         if (id.contains("download") || id.contains("update")) return false
-        return id.contains("skip_ad") || id.contains("ad_skip") || id.contains("count_down") ||
-                id.contains("splash_ad") || id.contains("skip_view") || id.contains("close_ad")
+        // splash_ad / ad_container 是广告容器本身，点它等于点了广告（实测点进美团），不能当跳过键
+        return id.contains("skip_ad") || id.contains("ad_skip") || id.contains("skip_view") ||
+                id.contains("close_ad") || id.contains("skip")
+    }
+
+    /** 广告容器往往占满整屏，只有按钮尺寸的节点才允许按 id 盲点。 */
+    private fun isButtonSized(node: AccessibilityNodeInfo): Boolean {
+        val b = Rect()
+        node.getBoundsInScreen(b)
+        val dm = resources.displayMetrics
+        return b.width() < dm.widthPixels * 0.5f && b.height() < dm.heightPixels * 0.25f
     }
 
     private fun sampleList(root: AccessibilityNodeInfo, limit: Int = 12): List<String> {
@@ -821,7 +910,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
     }
 
     private fun clickNode(node: AccessibilityNodeInfo): Boolean {
-        if (node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+        if (node.isClickable && node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+        // 不可点的文字节点直接按它自己的中心点落指，比点祖先容器稳
         val r = Rect()
         node.getBoundsInScreen(r)
         if (r.width() <= 0 || r.height() <= 0) return false

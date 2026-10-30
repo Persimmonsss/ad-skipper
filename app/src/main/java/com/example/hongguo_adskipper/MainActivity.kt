@@ -146,7 +146,7 @@ class MainActivity : AppCompatActivity() {
         val nls = isNlsEnabled()
         val overlay = AndroidSettings.canDrawOverlays(this)
 
-        tvA11y.text = if (a11y) "无障碍服务：已开启" else "无障碍服务：未开启（开屏/红果需要）"
+        tvA11y.text = if (a11y) "无障碍服务：已开启" else "无障碍服务：未开启（开屏/红果/抖音需要）"
         tvNls.text = if (nls) "通知使用权：已开启" else "通知使用权：未开启（B站跳过需要）"
         tvOverlay.text = if (overlay) "悬浮窗：已开启" else "悬浮窗：未开启（气泡提示需要）"
         val battery = isIgnoringBattery()
@@ -182,7 +182,7 @@ class MainActivity : AppCompatActivity() {
         }
         tvStats.text = "B站跳过 ${Stats.biliSkipCount} 次 · 撤回 ${Stats.biliUndoCount} 次（最近 ${Stats.biliLastSkip}）" +
             " · 开屏点击 ${Stats.splashClickCount} 次" +
-            "\n红果检测 ${AdSkipAccessibilityService.adDetectedCount} 次" +
+            "\n红果/抖音检测 ${AdSkipAccessibilityService.adDetectedCount} 次" +
             " · 滑动 ${AdSkipAccessibilityService.adSkipCount} 次" +
             " · 成功 ${AdSkipAccessibilityService.adSkipSuccessCount} 次" +
             (Stats.lastError?.let { "\n异常：$it" } ?: "")

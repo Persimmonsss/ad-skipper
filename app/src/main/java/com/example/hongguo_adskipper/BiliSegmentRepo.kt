@@ -49,7 +49,9 @@ object BiliSegmentRepo {
     /**
      * 整句标题（带标点、很长）拿去搜索，B站 常返回一堆相似但不相干的视频；
      * 但只给首句又会漏掉目标（实测“一只小胡蜂钻进飞机”召不回原片，加上第二分句才命中），
-     * 所以按“前两个分句 → 首句 → 整句”依次试，命中即停。
+     * 所以依次试“前两个分句 → 首句 → 整句 → 末句（去掉年/日等数字）”，命中即停。
+     * 末句往往是事件名，比叙事性的首句更独特：BV1PMaw6tEJe 只用首句搜不到，
+     * 换成末句“瓜达拉哈拉大爆炸”才召回。
      */
     private fun searchKeywords(title: String): List<String> {
         val clauses = title.split('，', ',', '。', '！', '？', ' ', '|', '｜', '：', ':')
@@ -58,6 +60,10 @@ object BiliSegmentRepo {
         if (clauses.size >= 2) out.add((clauses[0] + clauses[1]).take(24))
         clauses.firstOrNull()?.let { out.add(it) }
         out.add(title.take(24))
+        clauses.lastOrNull()?.let { last ->
+            out.add(last)
+            out.add(last.replace(Regex("""[\d年月日]"""), "").take(16))
+        }
         return out.filter { it.isNotBlank() }
     }
 
