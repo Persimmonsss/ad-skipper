@@ -1162,7 +1162,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
         if (!screenOn()) return false
         if (!TARGET_PACKAGES.contains(activeWindowPackage())) return false
         val bounds = currentScreenBounds()
-        // 慢速拖动（650ms）而不是甩动：广告 SDK 常把「快速上滑」当打开落地页，慢拖只触发翻页
+        // 慢速拖动而不是甩动：广告 SDK 常把「快速上滑」当打开落地页，慢拖只触发翻页
+        // 500ms 是速度与安全的折中：再短会被广告当成深链，再长则用户嫌慢
         val sx = bounds.width() / 2f
         Log.d(TAG, "滑动坐标 x=${sx.toInt()} y=${(bounds.height() * 0.66f).toInt()}->${(bounds.height() * 0.36f).toInt()} 屏幕 ${bounds.width()}x${bounds.height()}")
         val path = Path().apply {
@@ -1173,7 +1174,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
         deepLinkGuardUntil = SystemClock.elapsedRealtime() + 5000
         deepLinkBacks = 0
         val gesture = GestureDescription.Builder()
-            .addStroke(GestureDescription.StrokeDescription(path, 0, 650L))
+            .addStroke(GestureDescription.StrokeDescription(path, 0, 500L))
             .build()
         dispatchGesture(gesture, object : GestureResultCallback() {
             override fun onCompleted(gd: GestureDescription?) {

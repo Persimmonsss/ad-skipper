@@ -1,5 +1,6 @@
 <resources>
     <string name="app_name">跳跳狐</string>
+    <string name="app_title">跳跳狐（馨馨大王专用版）</string>
     <string name="a11y_service_label">跳跳狐（无障碍）</string>
     <string name="nls_service_label">跳跳狐（B站播放监听）</string>
     <string name="accessibility_service_description">用于跳过开屏广告，以及在红果短剧、抖音信息流中自动滑过广告。仅在检测到广告控件时执行点击，不收集任何个人数据。</string>
