@@ -252,12 +252,14 @@ class BiliUiSkip(
             return
         }
         attempts[seg.uuid] = tries + 1
+        Counters.inc(SkipStat.BILI_DETECT)
         bubble.hide()
         startSkip(seg)
     }
 
     /** 优先会话 seek（精确、不需要控件），失败再退回拖进度条。 */
     private fun startSkip(seg: AdSegment) {
+        Counters.inc(SkipStat.BILI_SKIP)
         val target = skipTargetMs(seg)
         val before = BiliPlaybackWatcher.biliPositionMs()
         if (BiliPlaybackWatcher.seekBili(target)) {
@@ -335,7 +337,7 @@ class BiliUiSkip(
             posAt = SystemClock.elapsedRealtime()
             Stats.biliPositionMs = posMs
         }
-        Stats.biliSkipCount++
+        Counters.inc(SkipStat.BILI_SUCCESS)
         Stats.biliLastSkip = "${fmt(seg.startMs)} → ${fmt(seg.endMs)}"
         Stats.log("seek 生效（${if (at.first) "界面" else "会话"}），当前 ${fmt(at.second)}")
         offerUndo(seg)
@@ -385,7 +387,7 @@ class BiliUiSkip(
         posMs = to
         posAt = SystemClock.elapsedRealtime()
         Stats.biliPositionMs = posMs
-        Stats.biliUndoCount++
+        Counters.inc(SkipStat.BILI_UNDO)
         Stats.biliLastSkip = "已撤回 → ${fmt(to)}"
         Stats.log("撤回跳过，回到 ${fmt(to)}")
         main.postDelayed({ verifyUndo(to) }, 1200)

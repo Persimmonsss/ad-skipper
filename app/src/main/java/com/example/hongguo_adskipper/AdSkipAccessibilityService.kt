@@ -111,6 +111,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
         private const val SPLASH_CLICK_CD_MS = 1000L
         // 节点点击与盲点各记各的预算：前两次空扫不能把额度花光，真广告常常 8 秒后才加载
         private const val SPLASH_NODE_MAX = 2
+        // 点过跳过按钮后，最多再等 6 秒确认开屏真的消失（超过就当这一条没数到）
+        private const val SPLASH_CLOSE_CONFIRM_MS = 6000L
         private val SKIP_LABEL = Regex("""(?i)^(跳过|跳過|关闭|關閉|skip|close)(广告|廣告)?(\s*\d+\s*[s秒]?)?$""")
         private val SKIP_CONTAINS = listOf("跳过", "跳過", "关闭", "關閉", "skip", "close")
         // 「关闭」类文案太常见：B站视频页的「关闭弹幕」就被当成开屏按钮点过
@@ -145,15 +147,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
         var lastScreenTexts: List<String> = emptyList()
             private set
 
-        // 广告统计
-        var adDetectedCount = 0     // 检测到广告的次数
-            private set
-        var adSkipCount = 0         // 尝试跳过（执行了滑动）的次数
-            private set
-        var adSkipSuccessCount = 0  // 成功跳过（滑动后不再检测到广告）的次数
-            private set
-        var adSkipFailCount = 0     // 失败次数
-            private set
+        // 广告统计（累计值在 Counters 里持久化，这里只留最近一次的信息）
         var lastAdKeyword = "-"    // 最后一次命中的关键词
             private set
         var lastAdTime = "-"       // 最后一次检测到广告的时间
@@ -161,8 +155,6 @@ class AdSkipAccessibilityService : AccessibilityService() {
 
         // 界面检测统计
         var screenCheckCount = 0    // 总共检查了多少次
-            private set
-        var hongguoDetectedCount = 0 // 检测到红果在前台多少次
             private set
 
         // 调试日志
@@ -295,7 +287,9 @@ class AdSkipAccessibilityService : AccessibilityService() {
             this, 0, intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
-        val text = "检测:${hongguoDetectedCount}次 广告:${adDetectedCount}次 跳过:${adSkipCount}次"
+        val text = "已跳过 B站 ${Counters.of(SkipStat.BILI_SUCCESS)} · " +
+            "开屏 ${Counters.of(SkipStat.SPLASH_SUCCESS)} · " +
+            "红果 ${Counters.of(SkipStat.HG_SUCCESS)}"
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, CHANNEL_ID)
                 .setContentTitle(notificationTitle)
@@ -515,7 +509,6 @@ class AdSkipAccessibilityService : AccessibilityService() {
 
     private fun processScreen(rootNode: AccessibilityNodeInfo, currentTime: Long) {
         screenCheckCount++
-        hongguoDetectedCount++
 
         // 1. 采集屏幕所有文字
         val allTexts = mutableListOf<String>()
@@ -606,7 +599,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
             return
         }
         lastAdKeyword = keyword
-        adDetectedCount++
+        Counters.inc(SkipStat.HG_DETECT)
         hintStreak = 0
         lastAdDetectedTime = currentTime
         lastAdTime = formatTime(currentTime)
@@ -616,7 +609,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
         logDebug("广告命中:[$keyword] 剧:$dramaTitle 集:$currentEpisode")
 
         lastSwipeTime = currentTime
-        adSkipCount++
+        Counters.inc(SkipStat.HG_SKIP)
         sendStatsBroadcast()
         handler.postDelayed({
             if (performSwipeUp()) {
@@ -994,7 +987,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
             }
             val stillAd = score >= HINT_SCORE
             if (stillAd) {
-                adSkipFailCount++
+                Counters.inc(SkipStat.HG_FAIL)
                 // 倒计时锁定型广告：红果开头锁定上滑（x 秒后可划），首滑无效是正常的。
                 // 复核失败进入快速重试循环（绕过 3 秒节流），倒计时一结束立即划走。
                 if (!retryingAd) {
@@ -1024,7 +1017,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
                     logDebug("倒计时重试 ${LOCK_RETRY_MAX} 次仍失败，放弃，交给轮询")
                 }
             } else {
-                adSkipSuccessCount++
+                Counters.inc(SkipStat.HG_SUCCESS)
                 retryingAd = false
                 lockRetries = 0
                 logDebug("滑动成功，已离开广告（残留 ${(score * 100).toInt()}%）")
@@ -1208,6 +1201,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
     private var splashAdStreak = 0
     private var splashNodeClicks = 0
     private var lastSplashClick = 0L
+    private var splashClosedPending = false
     private var lastSplashScan = 0L
     private var splashTreeLogs = 0
     private var lastSplashDigest = ""
@@ -1248,6 +1242,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
         splashUntil = now + SPLASH_WINDOW_MS
         splashAdStreak = 0
         splashNodeClicks = 0
+        splashClosedPending = false
         lastSplashClick = 0
         lastSplashScan = 0
         splashTreeLogs = 0
@@ -1273,23 +1268,41 @@ class AdSkipAccessibilityService : AccessibilityService() {
             }
             return
         }
-        if (splashNodeClicks >= SPLASH_NODE_MAX) return
+        // 点击预算用尽后不再扫（省算力），但刚点过、还没复核出结果时必须继续扫，
+        // 否则这一条开屏到底有没有被跳掉就永远数不到
+        if (splashNodeClicks >= SPLASH_NODE_MAX && !splashClosedPending) return
         if (now - lastSplashClick < SPLASH_CLICK_CD_MS) return
         if (now - lastSplashScan < SPLASH_SCAN_STEP_MS) return
         lastSplashScan = now
 
         val roots = splashRoots(pkg)
         if (roots.isEmpty()) return
+        // 点过跳过按钮后，若某一拍既找不到跳过按钮、也不像广告面，说明开屏真的被跳掉了；
+        // 6 秒内没等到就放弃这一条的复核（预算用尽后扫描会提前 return，不能无限等）
+        if (splashClosedPending) {
+            val noBudget = now - lastSplashClick > SPLASH_CLOSE_CONFIRM_MS
+            val gone = roots.none { findSplashSkipNode(it, 0, 16) != null } &&
+                !looksLikeSplashAd(roots, roots.flatMap { sampleList(it, 8) })
+            if (noBudget) {
+                splashClosedPending = false
+            } else if (gone) {
+                splashClosedPending = false
+                Counters.inc(SkipStat.SPLASH_SUCCESS)
+                logDebug("开屏已关闭")
+            }
+        }
         val node = roots.firstNotNullOfOrNull { findSplashSkipNode(it, 0, 16) }
         if (node != null) {
             // 同一个键点过一次没反应就不再点：实测连点两下会把用户带进广告落地页
             val key = "${node.viewIdResourceName}|${node.text}|${node.contentDescription}|${node.className}"
             if (key == lastSplashClickKey) return
+            if (splashNodeClicks >= SPLASH_NODE_MAX) return
             if (clickNode(node)) {
                 splashNodeClicks++
                 lastSplashClickKey = key
                 lastSplashClick = SystemClock.elapsedRealtime()
-                Stats.splashClickCount++
+                splashClosedPending = true
+                Counters.inc(SkipStat.SPLASH_SKIP)
                 val label = node.text?.toString()?.take(8)
                     ?: node.contentDescription?.toString()?.take(8)
                     ?: node.viewIdResourceName?.substringAfterLast('/')
@@ -1305,7 +1318,10 @@ class AdSkipAccessibilityService : AccessibilityService() {
         splashAdStreak = if (adSurface) splashAdStreak + 1 else 0
         // 广告特征连续两拍才认，避免普通页面里一两个“广告”字样就续期
         val confirmedAd = splashAdStreak >= 2
-        if (confirmedAd) splashUntil = maxOf(splashUntil, now + SPLASH_RENEW_MS)
+        if (confirmedAd) {
+            if (splashAdStreak == 2) Counters.inc(SkipStat.SPLASH_DETECT)
+            splashUntil = maxOf(splashUntil, now + SPLASH_RENEW_MS)
+        }
         val digest = samples.joinToString("/")
         if (digest != lastSplashDigest && splashTreeLogs < 4) {
             lastSplashDigest = digest

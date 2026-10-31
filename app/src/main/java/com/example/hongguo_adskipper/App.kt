@@ -6,5 +6,6 @@ class App : Application() {
     override fun onCreate() {
         super.onCreate()
         Settings.init(this)
+        Counters.init(this)
     }
 }

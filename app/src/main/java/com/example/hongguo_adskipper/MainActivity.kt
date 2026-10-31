@@ -212,12 +212,24 @@ class MainActivity : AppCompatActivity() {
                 if (dur > 0) append(" / ").append(fmt(dur))
             }
         }
-        tvStats.text = "B站跳过 ${Stats.biliSkipCount} 次 · 撤回 ${Stats.biliUndoCount} 次（最近 ${Stats.biliLastSkip}）" +
-            " · 开屏点击 ${Stats.splashClickCount} 次" +
-            "\n红果/抖音检测 ${AdSkipAccessibilityService.adDetectedCount} 次" +
-            " · 滑动 ${AdSkipAccessibilityService.adSkipCount} 次" +
-            " · 成功 ${AdSkipAccessibilityService.adSkipSuccessCount} 次" +
-            (Stats.lastError?.let { "\n异常：$it" } ?: "")
+        // 三个模块统一口径：检测（认出广告）/ 跳过（下发动作）/ 成功（复核生效），累计不清零
+        tvStats.text = buildString {
+            append("B站 检测 ").append(Counters.of(SkipStat.BILI_DETECT))
+            append(" · 跳过 ").append(Counters.of(SkipStat.BILI_SKIP))
+            append(" · 成功 ").append(Counters.of(SkipStat.BILI_SUCCESS))
+            append(" · 撤回 ").append(Counters.of(SkipStat.BILI_UNDO))
+            append("（最近 ").append(Stats.biliLastSkip).append("）")
+            append("\n开屏 检测 ").append(Counters.of(SkipStat.SPLASH_DETECT))
+            append(" · 点击 ").append(Counters.of(SkipStat.SPLASH_SKIP))
+            append(" · 成功 ").append(Counters.of(SkipStat.SPLASH_SUCCESS))
+            append("（最近 ").append(Stats.splashLastTarget).append("）")
+            append("\n红果 检测 ").append(Counters.of(SkipStat.HG_DETECT))
+            append(" · 滑动 ").append(Counters.of(SkipStat.HG_SKIP))
+            append(" · 成功 ").append(Counters.of(SkipStat.HG_SUCCESS))
+            append(" · 失败 ").append(Counters.of(SkipStat.HG_FAIL))
+            append("（最近 ").append(AdSkipAccessibilityService.lastAdTime).append("）")
+            Stats.lastError?.let { append("\n异常：$it") }
+        }
 
         val logs = Stats.logLines()
         tvLog.text = if (logs.isEmpty()) "等待事件…" else logs.joinToString("\n")
