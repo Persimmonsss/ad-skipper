@@ -1565,3 +1565,21 @@ AI交流/T14_广告截图留存/v241/：ad_115526_139_01.png … ad_120107_824_0
 - 推送前脱敏：T13/T14/对话记录 里的内网 adb 地址（192.168.2.x:port）统一替换为 `<内网adb地址>`。
 - 版本 2.4.2(22) → 2.4.3(23)，包 ad-skipper-v2.4.3.apk 已编译通过；
   未真机验证（Mi 10 / K40 当前都不在线），计数链路与开屏复核需要下一次真机回归确认。
+
+────────────────────────────────────────
+[10-31 16:05] 主 agent：22 个 commit 已推送到 GitHub（推送前重写历史补脱敏）
+- 网络实况：git 配置里的 127.0.0.1:21882 已失效，枚举本机 19 个 loopback 端口逐个
+  curl -x 探测全部不通；直连 github.com 被 DNS 指到 20.205.243.166 超时，但
+  140.82.112.4 / .113.4 / .114.4 实测 200。做法：.tmpshots/ghpin.js 起一个本地
+  CONNECT 代理（127.0.0.1:28899，只把 github 系列域名固定转发到可达 IP，其余拒绝），
+  推送用 git -c http.proxy=http://127.0.0.1:28899 push origin main。用完即停，不改全局配置。
+- 脱敏补漏：上一轮只把 HEAD 的 T13/T14/对话记录 改成 `<内网adb地址>`，但
+  origin/main..HEAD 的 22 笔历史快照里仍留着 192.168.2.x:port（仓库是 public）。
+  用 .tmpshots/scrub_history.py（plumbing：临时索引 read-tree → update-index →
+  write-tree → commit-tree，完整保留作者/提交者/时间/提交信息）重写这段历史，
+  共替换 40 个 blob。校验：重写后 HEAD 树与重写前 `git diff --stat` 为空（逐字节一致），
+  新历史里 192.168 命中 0 条。备份：tag pre-push-scrub（旧 tip 6169a74）
+  + .tmpshots/backup-2p43.bundle（--all，1.6MB）。
+- 结果：origin/main = aca1dda，59cae0c..aca1dda 快进推送成功，本地与远端一致。
+- 仍受阻（等设备）：B站最终包回归、开屏真广告验收、K40 装 v2.4.3 复验、
+  v2.4.3 计数链路（重启不清零 + 通知三模块汇总）真机确认。
