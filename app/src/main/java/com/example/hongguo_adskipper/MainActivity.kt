@@ -16,6 +16,7 @@ import android.provider.Settings as AndroidSettings
 import android.view.SoundEffectConstants
 import android.view.View
 import android.widget.Button
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
@@ -40,6 +41,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvBiliState: TextView
     private lateinit var tvStats: TextView
     private lateinit var tvLog: TextView
+    private lateinit var tvPerfHint: TextView
+    private lateinit var btnA11y: MaterialButton
+    private lateinit var btnNls: MaterialButton
+    private lateinit var btnOverlay: MaterialButton
+    private lateinit var btnBattery: MaterialButton
     private var audio: AudioManager? = null
 
     private val handler = Handler(Looper.getMainLooper())
@@ -69,6 +75,11 @@ class MainActivity : AppCompatActivity() {
         tvBiliState = findViewById(R.id.tv_bili_state)
         tvStats = findViewById(R.id.tv_stats)
         tvLog = findViewById(R.id.tv_log)
+        tvPerfHint = findViewById(R.id.tv_perf_hint)
+        btnA11y = findViewById(R.id.btn_a11y)
+        btnNls = findViewById(R.id.btn_nls)
+        btnOverlay = findViewById(R.id.btn_overlay)
+        btnBattery = findViewById(R.id.btn_battery)
         audio = getSystemService(AudioManager::class.java)
         findViewById<TextView>(R.id.tv_version).text = versionLabel()
 
@@ -95,6 +106,21 @@ class MainActivity : AppCompatActivity() {
             playClick()
             requestIgnoreBattery()
         }
+        findViewById<SeekBar>(R.id.sb_perf).apply {
+            progress = Settings.perfLevel
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                    if (fromUser) {
+                        Settings.perfLevel = p
+                        updatePerfHint(p)
+                    }
+                }
+
+                override fun onStartTrackingTouch(sb: SeekBar?) {}
+                override fun onStopTrackingTouch(sb: SeekBar?) {}
+            })
+        }
+        updatePerfHint(Settings.perfLevel)
         findViewById<Button>(R.id.btn_clear_log).setOnClickListener {
             playClick()
             Stats.clearLogs()
@@ -158,6 +184,12 @@ class MainActivity : AppCompatActivity() {
         setDot(dotOverlay, overlay)
         setDot(dotBattery, battery)
 
+        // 权限按钮状态同步：已开启的显示「已开启」并置灰，未开启的保持「去开启/去设置」可点
+        syncPermButton(btnA11y, a11y, "去开启")
+        syncPermButton(btnNls, nls, "去开启")
+        syncPermButton(btnOverlay, overlay, "去开启")
+        syncPermButton(btnBattery, battery, "去设置")
+
         swBili.isChecked = Settings.biliEnabled
         swBubble.isChecked = Settings.bubbleEnabled
         swSplash.isChecked = Settings.splashEnabled
@@ -191,9 +223,36 @@ class MainActivity : AppCompatActivity() {
         tvLog.text = if (logs.isEmpty()) "等待事件…" else logs.joinToString("\n")
     }
 
+    /** 省电/速度档位说明：随进度条实时更新。时延按真实链路算——
+     *  等下一次采样（0～采样间隔）+ 0.8 秒二次确认 + 1.2 秒后滑动。 */
+    private fun updatePerfHint(p: Int) {
+        val coolMs = (2600 - p * 24).coerceIn(900, 2600)
+        val fast = formatSeconds(2.0f)
+        val slow = formatSeconds((coolMs + 2000) / 1000f)
+        val mode = when {
+            p <= 20 -> "很省电"
+            p <= 45 -> "偏省电"
+            p <= 70 -> "平衡"
+            p <= 90 -> "偏快"
+            else -> "最快"
+        }
+        tvPerfHint.text = "$mode：平时 ${formatSeconds(coolMs / 1000f)} 扫一次，广告出现后 $fast–$slow 跳过"
+    }
+
+    private fun formatSeconds(s: Float): String {
+        val tenths = Math.round(s * 10)
+        return if (tenths % 10 == 0) "${tenths / 10} 秒" else "%.1f 秒".format(tenths / 10f)
+    }
+
     /** 状态点：绿=已开启，橙=未开启。 */
     private fun setDot(dot: View, on: Boolean) {
         dot.setBackgroundResource(if (on) R.drawable.dot_green else R.drawable.dot_orange)
+    }
+
+    /** 权限按钮随真实状态刷新：已开启 → 「已开启」+ 半透明（仍可点进设置查看）；未开启 → 原文案。 */
+    private fun syncPermButton(btn: MaterialButton, on: Boolean, offText: String) {
+        btn.text = if (on) "已开启" else offText
+        btn.alpha = if (on) 0.55f else 1f
     }
 
     private fun fmt(ms: Long): String {

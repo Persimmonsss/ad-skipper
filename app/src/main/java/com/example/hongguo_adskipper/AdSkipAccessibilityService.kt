@@ -11,7 +11,9 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Path
+import android.graphics.Point
 import android.graphics.Rect
+import android.hardware.display.DisplayManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -60,9 +62,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
         // 抖音信息流只在明确的「广告」角标上出手，CTA 单独出现不算
         private val DOUYIN_AD_BADGE = Regex("""^(广告|廣告|赞助|贊助|推广|推廣)(\s*[·|｜].*)?$""")
 
-        // 轮询：目标 App（红果/抖音等）前台 1.2s 高频兜底；其他前台 5s 低频（省电大头）
-        private const val CHECK_INTERVAL_ACTIVE_MS = 1200L
-        private const val CHECK_INTERVAL_IDLE_MS = 5000L
+        // 轮询间隔随档位动态算（checkIntervalActive/Idle），目标 App 前台高频兜底、其他前台低频省电
 
         // 轮询里反复用到，预编译避免每次检测都新建正则
         private val RE_BARE_DIGIT = Regex("""^\d{1,2}$""")
@@ -80,7 +80,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
         private val RE_CLOCK3 = Regex("""\d{1,2}:\d{2}:\d{2}""")
         private val RE_AD_ID = Regex(""".*\bad\b.*""")
         private const val SWIPE_DELAY_MS = 3000L
-        private const val AD_WAIT_MS = 1500L
+        private const val AD_WAIT_MS = 1200L
         private const val MAX_CONSECUTIVE_SWIPES = 3
         private const val RESET_TIMEOUT_MS = 10000L
         // 红果广告层底部「上滑继续看短剧」提示条的位置（1080×2340 基准）与匹配阈值
@@ -88,13 +88,15 @@ class AdSkipAccessibilityService : AccessibilityService() {
         // 不再用固定坐标/固定尺寸（红果提示条排版与位置随广告渲染浮动）
         private const val HINT_CELL = 4
         private const val HINT_SCORE = 0.85f
+        // 模板素材采集机：Mi 10 1080×2340、440dpi、density=2.75。别的机型按密度比缩放模板
+        private const val HINT_REF_DENSITY = 2.75f
+        // 采样/轮询间隔随 Settings.perfLevel 动态变化（0=省电 100=最快），见下方 hintSampleCool() 等
         private const val HINT_STREAK_NEED = 2
-        // 红果采样间隔两档：有广告迹象（提示条近似/命中）1.2s 高频确认；正常播放 3s 低频（省电）
-        private const val HINT_SAMPLE_HOT_MS = 1200L
-        private const val HINT_SAMPLE_COOL_MS = 3000L
         // 连续 N 拍毫无广告迹象后从高频回到低频
         private const val HINT_COOL_STREAK_RESET = 3
-        private const val SHOT_MIN_GAP_MS = 1200L
+        // 广告迹象确认期 0.8s（命中后的关键路径）；系统截图最小间隔 333ms，700ms 留足余量
+        private const val HINT_SAMPLE_HOT_MS = 800L
+        private const val SHOT_MIN_GAP_MS = 700L
         // 红果跳过后的撤回气泡停留时长
         private const val UNDO_BUBBLE_MS = 5000L
         // 倒计时锁定广告：复核失败后的快速重试间隔与上限（前 3 次 0.8s，后 2 次 2.4s，覆盖 10s+ 倒计时）
@@ -176,6 +178,9 @@ class AdSkipAccessibilityService : AccessibilityService() {
         private var lastHintSampleAt = 0L
         private var lastShotAt = 0L
         private var darkSampleInFlight = false
+        // 广告深链兜底：滑动后 5 秒内前台被广告顶到别的 App，立刻返回红果
+        private var deepLinkGuardUntil = 0L
+        private var deepLinkBacks = 0
 
         private val handler = Handler(Looper.getMainLooper())
     }
@@ -191,6 +196,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
     // 红果采样两档：有广告迹象时高频，正常播放回低频省电
     private var hintHot = false
     private var hintCoolStreak = 0
+    // 上一次采样的屏幕方向：旋转后搜索带/手势坐标整体换向，连续匹配不能跨方向累计
+    private var lastLandscape: Boolean? = null
     private val biliUi by lazy { BiliUiSkip(this, biliBubble) }
 
     // 前台包名：红果不在前台时不做轮询（省电）
@@ -204,7 +211,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
             } catch (e: Exception) {
                 logDebug("定时检测异常: ${e.message}")
             }
-            handler.postDelayed(this, if (foregroundPkg in TARGET_PACKAGES) CHECK_INTERVAL_ACTIVE_MS else CHECK_INTERVAL_IDLE_MS)
+            handler.postDelayed(this, if (foregroundPkg in TARGET_PACKAGES) checkIntervalActive() else checkIntervalIdle())
         }
     }
 
@@ -248,7 +255,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
         showNotification()
         handler.removeCallbacks(periodicCheck)
         handler.removeCallbacks(biliTicker)
-        handler.postDelayed(periodicCheck, if (foregroundPkg in TARGET_PACKAGES) CHECK_INTERVAL_ACTIVE_MS else CHECK_INTERVAL_IDLE_MS)
+        handler.postDelayed(periodicCheck, if (foregroundPkg in TARGET_PACKAGES) checkIntervalActive() else checkIntervalIdle())
         if (foregroundPkg == BiliUiSkip.BILI_PKG) ensureBiliTicker()
         logDebug("服务已启动 $notificationTitle")
     }
@@ -332,6 +339,11 @@ class AdSkipAccessibilityService : AccessibilityService() {
             // 气泡正好在广告前 3 秒出现，一顶掉前台包名就会打断 B站扫描
             foregroundPkg = if (pkg == packageName) activeWindowPackage().ifEmpty { pkg } else pkg
             foregroundAt = SystemClock.elapsedRealtime()
+            try {
+                maybeBlockAdDeepLink(pkg)
+            } catch (e: Exception) {
+                Log.w(TAG, "深链兜底异常: ${e.message}")
+            }
         }
         if (Settings.splashEnabled) {
             try {
@@ -362,9 +374,34 @@ class AdSkipAccessibilityService : AccessibilityService() {
         processScreen(rootNode, currentTime)
     }
 
+    /**
+     * 广告深链兜底：全屏广告是可交互创意，滑动可能被广告 SDK 当成「上滑打开」，
+     * 把用户带进淘宝/支付宝/应用商店。滑动后 5 秒内一旦前台不是红果/桌面/本 App，
+     * 立刻 BACK 回来（最多 2 次）。宁可这一条广告没跳过，也绝不把用户送进落地页。
+     */
+    private fun maybeBlockAdDeepLink(pkg: String?) {
+        if (pkg.isNullOrEmpty() || SystemClock.elapsedRealtime() > deepLinkGuardUntil) return
+        if (pkg in TARGET_PACKAGES || pkg == packageName) return
+        if (pkg == "com.miui.home" || pkg == "com.android.systemui") {
+            deepLinkGuardUntil = 0
+            return
+        }
+        if (deepLinkBacks >= 2) {
+            deepLinkGuardUntil = 0
+            return
+        }
+        deepLinkBacks++
+        logDebug("拦截广告跳转：$pkg → 返回红果(${deepLinkBacks})")
+        handler.postDelayed({
+            val top = activeWindowPackage()
+            if (top !in TARGET_PACKAGES && top != "com.miui.home") {
+                performGlobalAction(GLOBAL_ACTION_BACK)
+            }
+        }, 350)
+    }
+
     /** 滑动节流 + 连续滑动预算：命中后统一在 onAdDetected 里检查，避免事件驱动下重复滑动。 */
-    private fun canSwipeNow(now: Long): Boolean {
-        if (now - lastSwipeTime < SWIPE_DELAY_MS) return false
+    private fun canSwipeNow(now: Long): Boolean {        if (now - lastSwipeTime < SWIPE_DELAY_MS) return false
         if (consecutiveSwipes >= MAX_CONSECUTIVE_SWIPES) {
             if (now - lastAdDetectedTime <= RESET_TIMEOUT_MS) return false
             consecutiveSwipes = 0
@@ -414,6 +451,29 @@ class AdSkipAccessibilityService : AccessibilityService() {
             true
         }
 
+    /**
+     * 当前屏幕尺寸（随旋转更新）。无障碍服务的 resources.displayMetrics 属于非可视上下文，
+     * 旋转后可能仍是旧方向；手势坐标按旧尺寸算会直接落到屏外（横屏实测滑动无反应）。
+     * 这里以 DisplayManager 的实时尺寸为准，取不到才退回 displayMetrics。
+     */
+    fun currentScreenBounds(): Rect {
+        val dm = resources.displayMetrics
+        val point = Point()
+        val display = try {
+            getSystemService(DisplayManager::class.java)?.getDisplay(Display.DEFAULT_DISPLAY)
+        } catch (e: Exception) {
+            null
+        }
+        val ok = display != null && try {
+            display.getRealSize(point)
+            point.x > 0 && point.y > 0
+        } catch (e: Exception) {
+            false
+        }
+        return if (ok) Rect(0, 0, point.x, point.y)
+        else Rect(0, 0, dm.widthPixels, dm.heightPixels)
+    }
+
     /** 活动窗口的包名比 rootInActiveWindow 更早跟上 App 切换。 */
     private fun activeWindowPackage(): String {
         val fromWindows = try {
@@ -434,6 +494,23 @@ class AdSkipAccessibilityService : AccessibilityService() {
         return root ?: rootInActiveWindow
     }
 
+    // ==================== 省电/速度档位 ====================
+    // 用户在主界面用进度条在「跳广告速度 ↔ 省电」之间选择（Settings.perfLevel 0~100）。
+    // 档位只影响「无广告迹象时的采样频率」与「轮询兜底频率」；
+    // 广告一旦确认（提示条 ≥0.85），确认与滑动链路固定 0.8s+1.2s 不随档位变慢。
+
+    /** 正常播放（无广告迹象）时的红果采样间隔：速度端 0.9s，省电端 2.6s。 */
+    private fun hintSampleCool(): Long =
+        (2600 - Settings.perfLevel * 24).coerceIn(900, 2600).toLong()
+
+    /** 目标 App 前台轮询兜底间隔：速度端 0.9s，省电端 1.8s。 */
+    private fun checkIntervalActive(): Long =
+        (1800 - Settings.perfLevel * 10).coerceIn(900, 1800).toLong()
+
+    /** 非目标 App 前台轮询间隔（只刷新前台包名，不读界面）：速度端 5s，省电端 10s。 */
+    private fun checkIntervalIdle(): Long =
+        (10000 - Settings.perfLevel * 50).coerceIn(5000, 10000).toLong()
+
     // ==================== 核心处理：采集 + 检测广告 ====================
 
     private fun processScreen(rootNode: AccessibilityNodeInfo, currentTime: Long) {
@@ -450,14 +527,35 @@ class AdSkipAccessibilityService : AccessibilityService() {
 
         // 3. 检测广告
         val pkg = rootNode.packageName?.toString().orEmpty()
+        if (pkg !in HONGGUO_PACKAGES) {
+            // 红果不在前台时采样链停摆，残留的「连续匹配」必须清掉：实测切出 27 秒再切回，
+            // 旧 streak 会让回来后的第一帧直接凑成第 2 拍（单帧确认，遇过渡画面就可能误滑）
+            hintStreak = 0
+            hintHot = false
+            hintCoolStreak = 0
+        } else {
+            // 全屏时用户可能旋转屏幕：方向一变搜索带整块换位（竖屏底部 ↔ 横屏右上），
+            // 旧方向的匹配不能算数；同时立刻重采样，不等低频档位。
+            val bounds = currentScreenBounds()
+            val landscapeNow = bounds.width() > bounds.height()
+            if (lastLandscape != null && lastLandscape != landscapeNow) {
+                hintStreak = 0
+                hintHot = false
+                hintCoolStreak = 0
+                lastHintSampleAt = 0
+                logDebug("方向切换 ${if (landscapeNow) "横屏" else "竖屏"}，重新采样")
+            }
+            lastLandscape = landscapeNow
+        }
         // 倒计时重试循环进行中：红果还在同一广告页，轮询不再重复触发（避免耗尽连续滑动预算）
         if (retryingAd) return
-        if (pkg in HONGGUO_PACKAGES && currentTime - lastHintSampleAt >= if (hintHot) HINT_SAMPLE_HOT_MS else HINT_SAMPLE_COOL_MS) {
+        if (pkg in HONGGUO_PACKAGES && currentTime - lastHintSampleAt >= if (hintHot) HINT_SAMPLE_HOT_MS else hintSampleCool()) {
             // 红果剧间广告画在自家窗口里，无障碍树原样留着上一集的 60 多条文案
             //（实测：「第12集/选集/评论」全在，广告自身一个字都不进树），文字判定必然误伤。
             // 唯一稳定的画面标记是广告层底部的「上滑继续看短剧」提示，按模板匹配认它。
             lastHintSampleAt = currentTime
             sampleScreenMatch { score ->
+                if (score < 0f) return@sampleScreenMatch
                 if (score >= HINT_SCORE) {
                     hintHot = true
                     hintStreak++
@@ -560,10 +658,10 @@ class AdSkipAccessibilityService : AccessibilityService() {
         undoBubble.hide()
         if (!screenOn()) return
         if (!TARGET_PACKAGES.contains(activeWindowPackage())) return
-        val metrics = resources.displayMetrics
+        val bounds = currentScreenBounds()
         val path = Path().apply {
-            moveTo(metrics.widthPixels / 2f, metrics.heightPixels * 0.3f)
-            lineTo(metrics.widthPixels / 2f, metrics.heightPixels * 0.7f)
+            moveTo(bounds.width() / 2f, bounds.height() * 0.3f)
+            lineTo(bounds.width() / 2f, bounds.height() * 0.7f)
         }
         val gesture = GestureDescription.Builder()
             .addStroke(GestureDescription.StrokeDescription(path, 0, 300L))
@@ -584,24 +682,38 @@ class AdSkipAccessibilityService : AccessibilityService() {
     private val hintTemplates by lazy { loadHintTemplates() }
 
     private fun loadHintTemplates(): List<HintTemplate> {
+        val factors = templateScales()
         val out = ArrayList<HintTemplate>()
-        for (name in listOf("ad_hint.png", "ad_hint2.png")) {
+        for (name in listOf("ad_hint.png", "ad_hint2.png", "ad_hint_land.png")) {
             try {
-                val bmp = assets.open(name).use { BitmapFactory.decodeStream(it) }
-                if (bmp != null) {
-                    val cols = maxOf(1, bmp.width / HINT_CELL)
-                    val rows = maxOf(1, bmp.height / HINT_CELL)
-                    val cells = cellsOf(bmp.width, bmp.height, HINT_CELL) { x, y ->
+                val src = assets.open(name).use { BitmapFactory.decodeStream(it) } ?: continue
+                for (f in factors) {
+                    val w = maxOf(8, Math.round(src.width * f))
+                    val h = maxOf(8, Math.round(src.height * f))
+                    val bmp = if (f == 1f) src else Bitmap.createScaledBitmap(src, w, h, true)
+                    val cols = maxOf(1, w / HINT_CELL)
+                    val rows = maxOf(1, h / HINT_CELL)
+                    val cells = cellsOf(w, h, HINT_CELL) { x, y ->
                         luminance(bmp.getPixel(x, y)) > 150
                     }
-                    out.add(HintTemplate(cells, cols, rows, bmp.width, bmp.height))
-                    Log.i(TAG, "提示条模板加载: $name ${bmp.width}x${bmp.height}")
+                    out.add(HintTemplate(cells, cols, rows, w, h))
                 }
+                Log.i(TAG, "提示条模板加载: $name ${src.width}x${src.height} ×${factors.size}档")
             } catch (e: Exception) {
                 Log.w(TAG, "提示条模板 $name 读取失败: ${e.message}")
             }
         }
         return out
+    }
+
+    /**
+     * 模板按屏幕密度相对素材机（Mi 10 / 440dpi / 2.75x）的比值缩放，兼容不同分辨率机型。
+     * 同密度机型只用原尺寸；密度差得多的机型加 ±6% 兜取整误差。
+     */
+    private fun templateScales(): List<Float> {
+        val ratio = resources.displayMetrics.density / HINT_REF_DENSITY
+        return if (kotlin.math.abs(ratio - 1f) < 0.05f) listOf(1f)
+        else listOf(ratio * 0.94f, ratio, ratio * 1.06f)
     }
 
     private fun luminance(c: Int): Int =
@@ -628,22 +740,76 @@ class AdSkipAccessibilityService : AccessibilityService() {
         return out
     }
 
+    /** 整块区域一次 getPixels 再按 cell 降采样：逐像素 getPixel 走 JNI，横屏一拍要 800ms。 */
+    private fun regionCells(bmp: Bitmap, x0: Int, y0: Int, w: Int, h: Int, cell: Int): FloatArray {
+        val cols = maxOf(1, w / cell)
+        val rows = maxOf(1, h / cell)
+        val wpx = cols * cell
+        val out = FloatArray(rows * cols)
+        val rowPx = IntArray(wpx * cell)
+        val denom = (cell * cell).toFloat()
+        for (r in 0 until rows) {
+            bmp.getPixels(rowPx, 0, wpx, x0, y0 + r * cell, wpx, cell)
+            for (c in 0 until cols) {
+                var hit = 0
+                for (y in 0 until cell) {
+                    val base = y * wpx + c * cell
+                    for (x in 0 until cell) if (luminance(rowPx[base + x]) > 150) hit++
+                }
+                out[r * cols + c] = hit / denom
+            }
+        }
+        return out
+    }
+
     /**
-     * 底部大范围搜索 + 多模板 NCC（归一化互相关），返回 0-1 相似度。
-     * 提示条锚定「距屏幕底 130-340px、x 中心偏右」，预降采样粗搜（cell 网格）→ 1px 精搜，
-     * 兼容提示条位置/排版浮动（实测 y 在 185-298px 距底之间变化，旧固定坐标 ±20px 会漏）。
+     * 多模板 NCC（归一化互相关）搜索，返回 0-1 相似度。
+     * 竖屏提示条锚定在「屏幕水平中心、距屏底固定高度」：实测 x 346-756（中心 551、半宽 205）、
+     * 距底 130-340px。
+     * 横屏（红果 ShortSeriesLandActivity 2340×1080）提示条改画在**右上角**，文案也不同
+     * （「上滑继续观看剧集」）；实测 pill 位于 x 1564-1992、y 64-160，搜索带取右上区域。
+     * 尺寸一律按密度比缩放（提示条是 dp 尺寸，像素大小只跟 density 走）。
      */
     private fun matchHint(bmp: Bitmap): Float {
         val templates = hintTemplates
         if (templates.isEmpty()) return 0f
         val sw = bmp.width
         val sh = bmp.height
-        val sx = sw / 1080f
-        val sy = sh / 2340f
-        val x0 = (346 * sx).toInt()
-        val y0 = (sh - (340 * sy)).toInt()
-        val x1 = (756 * sx).toInt()
-        val y1 = (sh - (130 * sy)).toInt()
+        val u = resources.displayMetrics.density / HINT_REF_DENSITY
+        return if (sw > sh) {
+            // 右上角主搜索带（实测 pill x 0.67-0.85w、y 0.06-0.15h，留足余量）
+            val top = matchHintInBand(
+                bmp, (sw * 0.58f).toInt(), 0, sw, (sh * 0.20f).toInt(), templates
+            )
+            // 主带已过阈值就不扫底部兜底；只有没认出来才花这份算力
+            if (top >= HINT_SCORE) top else maxOf(
+                top,
+                matchHintInBand(
+                    bmp,
+                    (sw / 2f - 320f * u).toInt().coerceAtLeast(0),
+                    (sh - 420f * u).toInt().coerceAtLeast(0),
+                    (sw / 2f + 320f * u).toInt().coerceAtMost(sw),
+                    (sh - 70f * u).toInt().coerceAtMost(sh),
+                    templates
+                )
+            )
+        } else {
+            matchHintInBand(
+                bmp,
+                (sw / 2f - 210f * u).toInt().coerceAtLeast(0),
+                (sh - 340f * u).toInt().coerceAtLeast(0),
+                (sw / 2f + 210f * u).toInt().coerceAtMost(sw),
+                (sh - 130f * u).toInt().coerceAtMost(sh),
+                templates
+            )
+        }
+    }
+
+    private fun matchHintInBand(
+        bmp: Bitmap, x0: Int, y0: Int, x1: Int, y1: Int, templates: List<HintTemplate>
+    ): Float {
+        val sw = bmp.width
+        val sh = bmp.height
         if (x1 <= x0 || y1 <= y0) return 0f
         val cell = HINT_CELL
         // 区域宽高圆整到 cell 整数倍，保证与模板网格同为 cell 像素
@@ -652,9 +818,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
         if (rw <= 0 || rh <= 0) return 0f
         val gcols = rw / cell
         val grows = rh / cell
-        val region = cellsOf(rw, rh, cell) { dx, dy ->
-            luminance(bmp.getPixel(x0 + dx, y0 + dy)) > 150
-        }
+        val region = regionCells(bmp, x0, y0, rw, rh, cell)
         var best = -1f
         for (t in templates) {
             if (grows - t.rows < 0 || gcols - t.cols < 0) continue
@@ -691,10 +855,10 @@ class AdSkipAccessibilityService : AccessibilityService() {
             val ew = ex1 - ex0
             val eh = ey1 - ey0
             if (ew <= 0 || eh <= 0) continue
-            val bits = BooleanArray(ew * eh)
-            for (y in 0 until eh) for (x in 0 until ew) {
-                bits[y * ew + x] = luminance(bmp.getPixel(ex0 + x, ey0 + y)) > 150
-            }
+            val px = IntArray(ew * eh)
+            bmp.getPixels(px, 0, ew, ex0, ey0, ew, eh)
+            val bits = BooleanArray(px.size)
+            for (i in px.indices) bits[i] = luminance(px[i]) > 150
             val cells = FloatArray(t.rows * t.cols)
             for (dy in -cell..cell) {
                 for (dx in -cell..cell) {
@@ -744,17 +908,26 @@ class AdSkipAccessibilityService : AccessibilityService() {
         return if (den < 1e-6f) 0f else num / den
     }
 
-    /** 截图算提示条相似度；失败按「非广告」处理，宁可漏判也不误滑。 */
-    private fun sampleScreenMatch(retried: Boolean = false, onResult: (Float) -> Unit) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R || darkSampleInFlight) return
-        // 系统对 takeScreenshot 有最小间隔（连拍会报 error 3），错开一拍再试
+    /** 截图算提示条相似度；失败返回 -1 表示「没取到画面」，调用方不能把它当成功。 */
+    private fun sampleScreenMatch(retried: Boolean = false, busyRetries: Int = 0, onResult: (Float) -> Unit) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+        if (darkSampleInFlight) {
+            // 复核和轮询可能撞在同一帧：等这次采完再来，别把结果丢掉
+            if (busyRetries < 5) handler.postDelayed({ sampleScreenMatch(retried, busyRetries + 1, onResult) }, 200L)
+            else onResult(-1f)
+            return
+        }
+        // 系统对 takeScreenshot 有最小间隔（连拍会报 error 3），只补足剩余时间
         val now = SystemClock.elapsedRealtime()
-        if (now - lastShotAt < SHOT_MIN_GAP_MS) {
-            if (!retried) handler.postDelayed({ sampleScreenMatch(true, onResult) }, SHOT_MIN_GAP_MS)
+        val wait = SHOT_MIN_GAP_MS - (now - lastShotAt)
+        if (wait > 0) {
+            if (!retried) handler.postDelayed({ sampleScreenMatch(true, busyRetries, onResult) }, wait + 30)
+            else onResult(-1f)
             return
         }
         darkSampleInFlight = true
         lastShotAt = now
+        val shotAt = now
         try {
             takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor, object : TakeScreenshotCallback {
                 override fun onSuccess(result: ScreenshotResult) {
@@ -763,7 +936,15 @@ class AdSkipAccessibilityService : AccessibilityService() {
                     try {
                         val hw = Bitmap.wrapHardwareBuffer(result.hardwareBuffer, result.colorSpace)
                         val sw = hw?.copy(Bitmap.Config.ARGB_8888, false)
-                        if (sw != null) score = matchHint(sw)
+                        if (sw != null) {
+                            val t0 = SystemClock.elapsedRealtime()
+                            score = matchHint(sw)
+                            val cost = SystemClock.elapsedRealtime() - t0
+                            // 只在有广告迹象时记耗时：正常播放每拍都打日志既费电又淹没关键行
+                            if (score >= 0.6f) {
+                                logDebug("采样 截图${SystemClock.elapsedRealtime() - shotAt}ms 匹配${cost}ms 分数 ${(score * 100).toInt()}%")
+                            }
+                        }
                     } catch (e: Exception) {
                         Log.w(TAG, "截图分析失败: ${e.message}")
                     } finally {
@@ -775,27 +956,42 @@ class AdSkipAccessibilityService : AccessibilityService() {
                 override fun onFailure(errorCode: Int) {
                     darkSampleInFlight = false
                     Log.w(TAG, "截图失败: $errorCode")
-                    onResult(0f)
+                    onResult(-1f)
                 }
             })
         } catch (e: Exception) {
             darkSampleInFlight = false
             Log.w(TAG, "截图异常: ${e.message}")
-            onResult(0f)
+            onResult(-1f)
         }
     }
 
     /**
      * 检查滑动结果：广告页是无障碍树里看不出来的覆盖层，复核同样按画面判。
      */
-    private fun checkSwipeResult() {
-        // 滑动 + 复核一共延了 3.5 秒，用户可能已经按了电源；息屏时截图既没意义也费电
-        if (!screenOn()) return
-        val rootNode = activeWindowRoot() ?: return
-        val packageName = rootNode.packageName?.toString() ?: return
-        if (!TARGET_PACKAGES.contains(packageName)) return
+    private fun checkSwipeResult(attempt: Int = 0) {
+        // 滑动 + 复核一共延了 3.2 秒，用户可能已经按了电源；息屏时截图既没意义也费电
+        if (!screenOn()) { logDebug("复核跳过：已息屏"); return }
+        val rootNode = activeWindowRoot()
+        if (rootNode == null) { logDebug("复核跳过：取不到活动窗口"); return }
+        val packageName = rootNode.packageName?.toString()
+        if (packageName == null) { logDebug("复核跳过：窗口无包名"); return }
+        if (!TARGET_PACKAGES.contains(packageName)) {
+            logDebug("复核跳过：前台是 $packageName")
+            return
+        }
 
         sampleScreenMatch { score ->
+            // 没取到画面（撞帧/系统限流）：重试，不记成功也不记失败
+            if (score < 0f) {
+                if (attempt < 2) {
+                    logDebug("复核取样失败，500ms 后重试")
+                    handler.postDelayed({ checkSwipeResult(attempt + 1) }, 500)
+                } else {
+                    logDebug("复核取样连续失败，交给轮询")
+                }
+                return@sampleScreenMatch
+            }
             val stillAd = score >= HINT_SCORE
             if (stillAd) {
                 adSkipFailCount++
@@ -831,7 +1027,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
                 adSkipSuccessCount++
                 retryingAd = false
                 lockRetries = 0
-                logDebug("滑动成功，已离开广告")
+                logDebug("滑动成功，已离开广告（残留 ${(score * 100).toInt()}%）")
             }
             sendStatsBroadcast()
         }
@@ -949,7 +1145,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
             if (cls.toString().lowercase().contains("webview")) {
                 val bounds = Rect()
                 node.getBoundsInScreen(bounds)
-                if (bounds.top < resources.displayMetrics.heightPixels * 0.5f && bounds.height() > 100) return true
+                if (bounds.top < currentScreenBounds().height() * 0.5f && bounds.height() > 100) return true
             }
         }
         for (i in 0 until node.childCount) {
@@ -965,16 +1161,27 @@ class AdSkipAccessibilityService : AccessibilityService() {
     private fun performSwipeUp(): Boolean {
         if (!screenOn()) return false
         if (!TARGET_PACKAGES.contains(activeWindowPackage())) return false
-        val metrics = resources.displayMetrics
+        val bounds = currentScreenBounds()
+        // 慢速拖动（650ms）而不是甩动：广告 SDK 常把「快速上滑」当打开落地页，慢拖只触发翻页
+        val sx = bounds.width() / 2f
+        Log.d(TAG, "滑动坐标 x=${sx.toInt()} y=${(bounds.height() * 0.66f).toInt()}->${(bounds.height() * 0.36f).toInt()} 屏幕 ${bounds.width()}x${bounds.height()}")
         val path = Path().apply {
-            moveTo(metrics.widthPixels / 2f, metrics.heightPixels * 0.7f)
-            lineTo(metrics.widthPixels / 2f, metrics.heightPixels * 0.3f)
+            moveTo(sx, bounds.height() * 0.66f)
+            lineTo(sx, bounds.height() * 0.36f)
         }
+        // 滑动可能被广告创意吃成深链：开 5 秒守护，跳到别的 App 立刻 BACK 回来
+        deepLinkGuardUntil = SystemClock.elapsedRealtime() + 5000
+        deepLinkBacks = 0
         val gesture = GestureDescription.Builder()
-            .addStroke(GestureDescription.StrokeDescription(path, 0, 300L))
+            .addStroke(GestureDescription.StrokeDescription(path, 0, 650L))
             .build()
         dispatchGesture(gesture, object : GestureResultCallback() {
-            override fun onCompleted(gd: GestureDescription?) { Log.d(TAG, "滑动完成") }
+            override fun onCompleted(gd: GestureDescription?) {
+                Log.d(TAG, "滑动完成")
+                // 广告吞手势跳深链时系统事件可能延迟，主动补两次前台检查
+                handler.postDelayed({ maybeBlockAdDeepLink(activeWindowPackage()) }, 800)
+                handler.postDelayed({ maybeBlockAdDeepLink(activeWindowPackage()) }, 2200)
+            }
             override fun onCancelled(gd: GestureDescription?) { Log.w(TAG, "滑动取消") }
         }, null)
         return true
@@ -1197,11 +1404,11 @@ class AdSkipAccessibilityService : AccessibilityService() {
         if (!SKIP_COUNTDOWN.matches(label)) return false
         val b = Rect()
         node.getBoundsInScreen(b)
-        val dm = resources.displayMetrics
-        if (b.height() > dm.heightPixels * 0.12f) return false
-        val rightSide = b.left > dm.widthPixels * 0.55f
-        val topBand = b.top < dm.heightPixels * 0.22f
-        val bottomBand = b.top > dm.heightPixels * 0.7f
+        val screen = currentScreenBounds()
+        if (b.height() > screen.height() * 0.12f) return false
+        val rightSide = b.left > screen.width() * 0.55f
+        val topBand = b.top < screen.height() * 0.22f
+        val bottomBand = b.top > screen.height() * 0.7f
         return rightSide && (topBand || bottomBand)
     }
 
@@ -1217,8 +1424,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
     private fun isButtonSized(node: AccessibilityNodeInfo): Boolean {
         val b = Rect()
         node.getBoundsInScreen(b)
-        val dm = resources.displayMetrics
-        return b.width() < dm.widthPixels * 0.5f && b.height() < dm.heightPixels * 0.25f
+        val screen = currentScreenBounds()
+        return b.width() < screen.width() * 0.5f && b.height() < screen.height() * 0.25f
     }
 
     private fun sampleList(root: AccessibilityNodeInfo, limit: Int = 12): List<String> {

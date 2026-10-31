@@ -458,8 +458,9 @@ class BiliUiSkip(
 
     /** 单击播放区唤出控件（控件已隐藏时不会暂停播放）。 */
     private fun revealControls() {
-        val m = service.resources.displayMetrics
-        tap(m.widthPixels / 2f, m.heightPixels * 0.22f)
+        val b = (service as? AdSkipAccessibilityService)?.currentScreenBounds()
+            ?: Rect(0, 0, service.resources.displayMetrics.widthPixels, service.resources.displayMetrics.heightPixels)
+        tap(b.width() / 2f, b.height() * 0.22f)
     }
 
     /**

@@ -281,6 +281,36 @@
                 android:text="红果短剧、抖音信息流检测到「广告」标识时自动上滑"
                 android:textColor="@color/text_hint"
                 android:textSize="11sp" />
+
+            <View
+                android:layout_width="match_parent"
+                android:layout_height="1dp"
+                android:layout_marginTop="12dp"
+                android:background="@color/bg_card_stroke" />
+
+            <TextView
+                android:id="@+id/tv_perf_label"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="检测节奏：跳广告速度 ⟷ 省电"
+                android:textColor="@color/text_primary"
+                android:textSize="14sp" />
+
+            <TextView
+                android:id="@+id/tv_perf_hint"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="拉向左边更省电；拉向右边响应更快"
+                android:textColor="@color/text_hint"
+                android:textSize="11sp" />
+
+            <SeekBar
+                android:id="@+id/sb_perf"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:max="100" />
         </LinearLayout>
 
         <!-- 运行状态 -->

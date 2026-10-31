@@ -31,4 +31,9 @@ object Settings {
     var hongguoEnabled: Boolean
         get() = sp().getBoolean("hongguo_enabled", true)
         set(v) { putBool("hongguo_enabled", v) }
+
+    /** 省电/速度档位：0=最省电（检测最慢），100=最快（较耗电），默认 65（平衡）。 */
+    var perfLevel: Int
+        get() = sp().getInt("perf_level", 65)
+        set(v) { sp().edit().putInt("perf_level", v.coerceIn(0, 100)).apply() }
 }
