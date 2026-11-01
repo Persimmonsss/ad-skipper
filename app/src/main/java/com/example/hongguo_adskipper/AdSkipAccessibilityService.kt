@@ -173,6 +173,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
         // 广告深链兜底：滑动后 5 秒内前台被广告顶到别的 App，立刻返回红果
         private var deepLinkGuardUntil = 0L
         private var deepLinkBacks = 0
+        // 开屏点「跳过」同样可能被广告热区吃成深链，守护期内期望的前台是这个包
+        private var splashGuardPkg = ""
 
         private val handler = Handler(Looper.getMainLooper())
     }
@@ -375,7 +377,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
      */
     private fun maybeBlockAdDeepLink(pkg: String?) {
         if (pkg.isNullOrEmpty() || SystemClock.elapsedRealtime() > deepLinkGuardUntil) return
-        if (pkg in TARGET_PACKAGES || pkg == packageName) return
+        if (pkg in TARGET_PACKAGES || pkg == packageName || pkg == splashGuardPkg) return
         if (pkg == "com.miui.home" || pkg == "com.android.systemui") {
             deepLinkGuardUntil = 0
             return
@@ -385,10 +387,10 @@ class AdSkipAccessibilityService : AccessibilityService() {
             return
         }
         deepLinkBacks++
-        logDebug("拦截广告跳转：$pkg → 返回红果(${deepLinkBacks})")
+        logDebug("拦截广告跳转：$pkg → 返回原应用(${deepLinkBacks})")
         handler.postDelayed({
             val top = activeWindowPackage()
-            if (top !in TARGET_PACKAGES && top != "com.miui.home") {
+            if (top != splashGuardPkg && top !in TARGET_PACKAGES && top != "com.miui.home") {
                 performGlobalAction(GLOBAL_ACTION_BACK)
             }
         }, 350)
@@ -1164,6 +1166,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
             lineTo(sx, bounds.height() * 0.36f)
         }
         // 滑动可能被广告创意吃成深链：开 5 秒守护，跳到别的 App 立刻 BACK 回来
+        splashGuardPkg = ""
         deepLinkGuardUntil = SystemClock.elapsedRealtime() + 5000
         deepLinkBacks = 0
         val gesture = GestureDescription.Builder()
@@ -1317,6 +1320,13 @@ class AdSkipAccessibilityService : AccessibilityService() {
                 lastSplashClickKey = key
                 lastSplashClick = SystemClock.elapsedRealtime()
                 splashClosedPending = true
+                // 点完开屏「跳过」同样开守护：这一跳若把前台带进别的 App（实测触发了
+                // 「晓晓优选 想要打开 美团」），说明点落在广告热区上，立刻 BACK 回去。
+                // 窗口只开 1.5 秒：实测深链的「想要打开 美团」在点完 260ms 就冒出来，
+                // 而用户自己切 App 是常态——开太久会把正常切换误判成深链（5 秒时实测误伤两次 BACK）。
+                splashGuardPkg = pkg
+                deepLinkGuardUntil = SystemClock.elapsedRealtime() + 1500
+                deepLinkBacks = 0
                 if (!splashSkipCounted) {
                     splashSkipCounted = true
                     Counters.inc(SkipStat.SPLASH_SKIP)
@@ -1415,7 +1425,16 @@ class AdSkipAccessibilityService : AccessibilityService() {
             return node // 点「跳过」这两个字本身，不去点可点的祖先（实测祖先常是广告容器）
         }
         if (isSkipViewId(id) && isButtonSized(node)) {
-            clickableTarget(node)?.let { splashMatchInfo = "id=$id"; return it }
+            // 按 id 命中只许点「按钮自己」或「同样只有按钮尺寸的可点祖先」。实测晓晓优选
+            // (TopOn 聚合)的 tobid_splash_skip_text 往上爬到的可点 RelativeLayout 是整块广告热区，
+            // 点它直接触发深链，被 MIUI 拦成「晓晓优选 想要打开 美团」。
+            val target = if (node.isClickable && node.isVisibleToUser) node else clickableAncestorAsButton(node)
+            if (target != null) {
+                val box = Rect()
+                target.getBoundsInScreen(box)
+                splashMatchInfo = "id=$id 点击区${box.width()}x${box.height()}"
+                return target
+            }
         }
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
@@ -1482,11 +1501,15 @@ class AdSkipAccessibilityService : AccessibilityService() {
         return out
     }
 
-    private fun clickableTarget(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        var cur: AccessibilityNodeInfo? = node
+    /**
+     * 只在「祖先自己也还是按钮尺寸」时才允许点祖先。往上爬到一个铺满屏幕的可点容器，
+     * 意味着点的是整块广告热区（会拉起落地页/别的 App），这种情况一律不点、宁可漏跳。
+     */
+    private fun clickableAncestorAsButton(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        var cur = node.parent
         var guard = 0
-        while (cur != null && guard < 5) {
-            if (cur.isClickable && cur.isVisibleToUser) return cur
+        while (cur != null && guard < 3) {
+            if (cur.isClickable && cur.isVisibleToUser && isButtonSized(cur)) return cur
             cur = cur.parent
             guard++
         }
