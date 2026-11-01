@@ -14,3 +14,6 @@ captures/
 .DS_Store
 
 *.idsig
+
+# 真机取证临时目录（截图/logcat 体积大，不入库）
+.tmpshots/

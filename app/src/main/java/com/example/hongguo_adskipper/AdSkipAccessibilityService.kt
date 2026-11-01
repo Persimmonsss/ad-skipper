@@ -109,6 +109,9 @@ class AdSkipAccessibilityService : AccessibilityService() {
         private const val SPLASH_RENEW_MS = 8000L
         private const val SPLASH_SCAN_STEP_MS = 300L
         private const val SPLASH_CLICK_CD_MS = 1000L
+        // 窗口刚开始 0.5 秒内不点：厂商 ROM 的启动快照期会画着上一次退出时的界面，
+        // 这时扫到的「跳过」可能是已经不存在的广告，点下去打在刚显示出来的首页上（业界同参数）
+        private const val SPLASH_FIRST_CLICK_MS = 500L
         // 节点点击与盲点各记各的预算：前两次空扫不能把额度花光，真广告常常 8 秒后才加载
         private const val SPLASH_NODE_MAX = 2
         // 点过跳过按钮后，最多再等 6 秒确认开屏真的消失（超过就当这一条没数到）
@@ -122,17 +125,61 @@ class AdSkipAccessibilityService : AccessibilityService() {
             // 系统控制中心/通知栏的开关描述（如「飞行模式,关闭」）绝不能当跳过键点
             "飞行", "模式", "蓝牙", "Wi-Fi", "wifi", "WLAN", "热点", "静音",
             "震动", "勿扰", "护眼", "深色", "亮度", "旋转", "数据", "流量",
-            "同步", "省电", "电池", "自动"
+            "同步", "省电", "电池", "自动",
+            // GKD 全局开屏规则的 excludeMatches 原文里排掉的：播放器设置项
+            // （跳过片头/片尾）、弹窗动词、引导流程按钮，这些出现在「跳过」旁边时一律不点
+            "视频", "片头", "片尾", "帮助", "取消", "退出", "下一步", "完成",
+            "设置", "兴趣", "偏好", "同意", "历史", "书签"
         )
         // 只有出现在右上/右下角的纯数字才算倒计时按钮（美团类开屏常见）
         private val SKIP_COUNTDOWN = Regex("""^(跳过\s*)?\d{1,2}\s*[sS秒]?$""")
         private val SPLASH_AD_WORDS = listOf("广告", "廣告", "赞助", "投诉", "摇一摇", "摇动手机", "跳转第三方")
+        // 社区订阅（GKD 默认/AIsouler/Lin-arm、SKIP 规则库）里反复出现的开屏跳过件短名。
+        // 具名 id 比裸文案可信：文案可能被云控成广告入口，具名跳过件不会。
+        private val SPLASH_SKIP_IDS = listOf(
+            "tt_splash_skip_btn",                 // 穿山甲 Pangle
+            "tt_reward_full_count_down_after",
+            "adsdk__ids_component_close",
+            "ksad_splash_circle_skip_view",       // 快手联盟
+            "ksad_splash_circle_skip_left_view",
+            "ksad_splash_skip_view",
+            "ksad_auto_close_btn",
+            "tobid_splash_skip_ll",               // TopOn 聚合（v2.4.5 实测命中 121x54）
+            "tobid_splash_skip_text",
+            "anythink_myoffer_btn_close_id",
+            "hiad_skip_text",                     // 华为广告
+            "hiad_banner_close_button",
+            "gdt_count_down_view",                // 腾讯优量汇
+            "gdt_v2_banner_ad_close_btn",
+            "ms_skipview",
+            "adgain_splash_skip_ll",
+            "splash_count_down_view",
+            "welcome_ad_view_skip",
+            "ad_skip_text",
+            "only_skip_rl",
+            "beizi_interstitial_ad_close",        // 倍孜（聚合前缀一起命中）
+            "splash_ad_close",                    // 闲鱼（实测命中）
+            "tv_skip",                            // 小蚕（实测命中）
+            "btn_skip",
+            // 以下补自 GKD 两份官方订阅 + SKIP 规则库（社区跨订阅重复出现，非我们自创）
+            "mjumpbtn",                           // 京东读书
+            "iv_jump",                            // 华尔街见闻（含 iv_jump_parent）
+            "adview_jump",                        // 科沃斯
+            "jump_over",                          // vivo 系
+            "vlion_ad_closed",                    // CSDN 穿山甲封装
+            "homesplash_close_fullscreen"         // 菜鸟
+        )
         private val SPLASH_SKIP_PKGS = listOf(
+            // pkg=android 是系统框架窗口（音量条、权限弹窗、Toast 容器），实测红果播放时
+            // 每分钟都会来一次，被当成「应用切换」后会起一轮开屏扫描并顶掉前台包名
+            "android",
             "com.android.systemui", "com.android.launcher", "com.android.settings",
             "com.phoenix.read", "com.miui.home", "com.miui.personalassistant",
             // 系统 UI/安全中心：通知栏、控制中心、系统弹窗不是开屏广告，绝不能扫更不能点
             "miui.systemui.plugin", "com.miui.systemui", "com.miui.securitycenter",
-            "com.miui.rom", "com.android.providers.media"
+            "com.miui.rom", "com.android.providers.media",
+            // 聊天类界面里「关闭/跳过」字样到处都是，误点代价最高（GKD 开屏组同样把它们整组关掉）
+            "com.tencent.mm", "com.tencent.mobileqq"
         )
 
         // ========== 统计数据 ==========
@@ -175,6 +222,25 @@ class AdSkipAccessibilityService : AccessibilityService() {
         private var deepLinkBacks = 0
         // 开屏点「跳过」同样可能被广告热区吃成深链，守护期内期望的前台是这个包
         private var splashGuardPkg = ""
+
+        // ===== 红果取证探针（只打日志，不参与任何判定与手势）=====
+        // 事件位直方图：TYPE_WINDOW_CONTENT_CHANGED 的 contentChangeTypes 各位计数
+        private const val PROBE_FLUSH_MS = 5000L
+        private const val PROBE_TREE_MS = 4000L
+        private const val PROBE_TREE_MAX = 200
+        private val probeContentBits = HashMap<Int, Int>()
+        private var probeScrolled = 0
+        private var probeFlushAt = 0L
+        private var probeTreeAt = 0L
+        private var probeTreeLogs = 0
+        private var probeBeatAt = 0L
+        // 正片控件：GKD 红果规则用它们的「在树里但不可见」反推广告压在上面，这里实测到底可不可见。
+        // 词表照抄 ad-auto 的 PLAYBACK_CONTROL_KEYWORDS（正剧播放特征，出现即绝不滑）
+        private val PROBE_MARKS = listOf(
+            "选集", "倍速", "热评", "剧评", "评论", "分享", "暂停", "下一集", "全屏观看", "剧备字",
+            "追剧", "展开", "全集", "已完结", "作者声明", "跟播", "点赞", "收藏", "弹幕"
+        )
+        private val PROBE_EP = Regex("第\\d+集")
 
         private val handler = Handler(Looper.getMainLooper())
     }
@@ -328,12 +394,21 @@ class AdSkipAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
+        probeEvents(event)
         val pkg = event.packageName?.toString()
         val appSwitched = pkg != null && pkg != foregroundPkg
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && pkg != null) {
-            // 自己的倒计时/撤回气泡也是本包的窗口事件，不能当成「切到了本 App」：
-            // 气泡正好在广告前 3 秒出现，一顶掉前台包名就会打断 B站扫描
-            foregroundPkg = if (pkg == packageName) activeWindowPackage().ifEmpty { pkg } else pkg
+            // 系统浮层（pkg=android 的框架窗口、输入法、权限弹窗、广告 SDK 浮层）也会送窗口
+            // 事件。只按事件包名更新前台归属，目标 App 明明在前台也会被反复顶掉，事件过滤
+            // 与「30 秒兜底」同时失效（实测红果播放器在前台 7 分钟零巡检、零树扫描，
+            // 前台包名被钉死在 android 上）。活动窗口是目标 App 时以它为准。
+            // 自己的倒计时/撤回气泡也是本包的窗口事件，同样不能当成「切到了本 App」。
+            val active = activeWindowPackage()
+            foregroundPkg = when {
+                TARGET_PACKAGES.contains(active) -> active
+                pkg == packageName -> active.ifEmpty { pkg }
+                else -> pkg
+            }
             foregroundAt = SystemClock.elapsedRealtime()
             try {
                 maybeBlockAdDeepLink(pkg)
@@ -378,7 +453,12 @@ class AdSkipAccessibilityService : AccessibilityService() {
     private fun maybeBlockAdDeepLink(pkg: String?) {
         if (pkg.isNullOrEmpty() || SystemClock.elapsedRealtime() > deepLinkGuardUntil) return
         if (pkg in TARGET_PACKAGES || pkg == packageName || pkg == splashGuardPkg) return
-        if (pkg == "com.miui.home" || pkg == "com.android.systemui") {
+        // 输入法弹到前台是点完广告后聚焦变化的常态，不是深链：实测点 B站 前贴片
+        // 「跳过 3」后 0.7 秒搜狗输入法上来，被当成跳转多按了一次 BACK
+        if (pkg.contains("inputmethod")) return
+        // 系统框架窗口（pkg=android）与桌面/通知栏同样不是深链：红果播放时它们每分钟都会
+        // 冒一次，误判成跳转就会真的按 BACK，把用户从播放器里踢出去
+        if (pkg == "android" || pkg == "com.miui.home" || pkg == "com.android.systemui") {
             deepLinkGuardUntil = 0
             return
         }
@@ -405,21 +485,143 @@ class AdSkipAccessibilityService : AccessibilityService() {
         return true
     }
 
+    // ==================== 红果取证探针（只读、只打日志）====================
+
+    /**
+     * 事件侧探针：量「红果播放时到底哪些 contentChangeTypes 在刷」和「切集是不是有
+     * TYPE_VIEW_SCROLLED」。这两条决定判定层能不能零截图、事件订阅能不能收窄省电。
+     */
+    private fun probeEvents(event: AccessibilityEvent) {
+        val pkg = event.packageName?.toString().orEmpty()
+        if (pkg !in HONGGUO_PACKAGES) return
+        when (event.eventType) {
+            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
+                var bits = event.contentChangeTypes
+                var shift = 0
+                while (bits != 0) {
+                    if (bits and 1 != 0) probeContentBits[shift] = (probeContentBits[shift] ?: 0) + 1
+                    bits = bits ushr 1
+                    shift++
+                }
+            }
+            AccessibilityEvent.TYPE_VIEW_SCROLLED -> {
+                probeScrolled++
+                val cls = event.className?.toString()?.substringAfterLast('.').orEmpty()
+                val sinceSwipe = if (lastSwipeTime == 0L) -1 else System.currentTimeMillis() - lastSwipeTime
+                Log.d(TAG, "探针·SCROLLED#$probeScrolled $cls ${event.fromIndex}→${event.toIndex}" +
+                    " items=${event.itemCount} 距上滑${sinceSwipe}ms")
+            }
+        }
+        val now = SystemClock.elapsedRealtime()
+        if (now - probeFlushAt >= PROBE_FLUSH_MS) {
+            probeFlushAt = now
+            if (probeContentBits.isNotEmpty()) {
+                Log.d(TAG, "探针·CONTENT " + probeContentBits.entries.sortedBy { it.key }
+                    .joinToString(" ") { "${contentBitName(it.key)}:${it.value}" })
+                probeContentBits.clear()
+            }
+        }
+    }
+
+    /**
+     * 位号→名字。值取自 android-34 的 android.jar（javap -constants 实测）：
+     * SUBTREE=1、TEXT=2、CONT_DESC=4、PANE_TITLE=8、PANE_APPEARED=16、PANE_DISAPPEARED=32、
+     * STATE_DESCRIPTION=64，再往上依次是 DRAG_*=128/256/512、CONTENT_INVALID=1024、ERROR=2048、ENABLED=4096。
+     */
+    private fun contentBitName(bit: Int): String = when (bit) {
+        0 -> "SUBTREE"
+        1 -> "TEXT"
+        2 -> "CONT_DESC"
+        3 -> "PANE_TITLE"
+        4 -> "PANE_IN"
+        5 -> "PANE_OUT"
+        6 -> "STATE_DESC"
+        else -> "bit$bit"
+    }
+
+    /**
+     * 树侧探针：正片控件（选集/倍速/第X集…）在广告压住时到底是「不可见」还是「整棵被剥掉」，
+     * 以及「上滑继续看短剧」这类文案能不能直接搜到。这是零截图判定的生死判据。
+     */
+    private fun probeHongguoTree(rootNode: AccessibilityNodeInfo) {
+        val now = SystemClock.elapsedRealtime()
+        if (now - probeTreeAt < PROBE_TREE_MS || probeTreeLogs >= PROBE_TREE_MAX) return
+        probeTreeAt = now
+        probeTreeLogs++
+        val marks = LinkedHashSet<String>()
+        var texts = 0
+        var scrollable = 0
+        var surfaces = 0
+        var adItem = 0
+        var renderView = false
+        fun walk(n: AccessibilityNodeInfo, d: Int) {
+            if (d > 18) return
+            val t = n.text?.toString()?.trim().orEmpty()
+            val label = if (t.isNotEmpty()) t else n.contentDescription?.toString()?.trim().orEmpty()
+            if (label.isNotEmpty()) {
+                texts++
+                val name = PROBE_MARKS.firstOrNull { label.contains(it) }
+                    ?: if (PROBE_EP.containsMatchIn(label)) label.take(6) else null
+                if (name != null && marks.size < 12) {
+                    val b = Rect()
+                    n.getBoundsInScreen(b)
+                    marks.add("$name${if (n.isVisibleToUser) "V" else "-"}${b.width()}x${b.height()}")
+                }
+            }
+            if (n.isScrollable) scrollable++
+            val cls = n.className?.toString().orEmpty()
+            if (cls.endsWith("SurfaceView") || cls.endsWith("TextureView")) surfaces++
+            // ad-auto 实测：三种广告形态的树里都同时有 ay0+i0t，84 个正剧 id 里两个都没有
+            when (n.viewIdResourceName?.substringAfterLast('/')) {
+                "ay0", "i0t" -> adItem++
+                "ttlive_player_render_view" -> renderView = true
+            }
+            for (i in 0 until n.childCount) n.getChild(i)?.let { walk(it, d + 1) }
+        }
+        walk(rootNode, 0)
+        val up = try {
+            rootNode.findAccessibilityNodeInfosByText("上滑").count { it.isVisibleToUser }
+        } catch (e: Exception) { -1 }
+        Log.d(TAG, "探针·树#$probeTreeLogs 文案$texts 上滑可见=$up ay0i0t=$adItem 渲染=$renderView " +
+            "可滚=$scrollable 表面对象=$surfaces 控件[${marks.joinToString(" ")}] 窗口[${probeWindowBrief()}]")
+    }
+
+    /** 便宜版窗口清单：只读 type/active/focused/包名，不遍历文案。 */
+    private fun probeWindowBrief(): String {
+        val parts = ArrayList<String>()
+        try {
+            for (w in windows) {
+                parts.add("${w.type}${if (w.isActive) "A" else ""}${if (w.isFocused) "F" else ""}" +
+                    ":${w.root?.packageName?.toString()?.substringAfterLast('.') ?: "-"}")
+            }
+        } catch (e: Exception) {
+            parts.add("err")
+        }
+        return parts.joinToString(",")
+    }
+
     // ==================== 定时轮询 ====================
 
     private fun performPeriodicCheck() {
         if (!screenOn()) return
-        // 兜底刷新前台包名（事件丢失时靠它恢复）
-        if (SystemClock.elapsedRealtime() - foregroundAt > 30_000) {
-            foregroundPkg = activeWindowPackage()
+        // 前台归属每拍都以活动窗口校正：窗口事件会把前台包名顶到系统浮层上，而
+        // 「30 秒兜底刷新」只要还有窗口事件进来就会被无限推迟，永远等不到
+        val active = activeWindowPackage()
+        if (active.isNotEmpty() && active != foregroundPkg) {
+            foregroundPkg = active
             foregroundAt = SystemClock.elapsedRealtime()
+        }
+        val beatNow = SystemClock.elapsedRealtime()
+        if (beatNow - probeBeatAt >= 30_000L) {
+            probeBeatAt = beatNow
+            Log.d(TAG, "探针·心跳 巡检=$screenCheckCount 前台=$foregroundPkg 活动=$active")
         }
         if (foregroundPkg == BiliUiSkip.BILI_PKG) ensureBiliTicker()
         if (!Settings.hongguoEnabled) return
         // 按需唤醒：只有红果在前台才扫描界面
         if (!TARGET_PACKAGES.contains(foregroundPkg)) return
         // 启动切换瞬间 rootInActiveWindow 可能仍是上一个 App，以活动窗口为准
-        if (!TARGET_PACKAGES.contains(activeWindowPackage())) return
+        if (!TARGET_PACKAGES.contains(active)) return
         val rootNode = activeWindowRoot()
         if (rootNode == null) {
             // 每20次打印一次"等待窗口"日志，避免刷屏
@@ -473,7 +675,10 @@ class AdSkipAccessibilityService : AccessibilityService() {
     /** 活动窗口的包名比 rootInActiveWindow 更早跟上 App 切换。 */
     private fun activeWindowPackage(): String {
         val fromWindows = try {
-            windows.firstOrNull { it.isActive }?.root?.packageName?.toString()
+            // MIUI 的分屏/小窗有时只置 focused 不置 active，只看 active 会拿到空
+            val ws = windows
+            (ws.firstOrNull { it.isActive } ?: ws.firstOrNull { it.isFocused })
+                ?.root?.packageName?.toString()
         } catch (e: Exception) {
             null
         }
@@ -483,7 +688,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
     /** 读界面文本时优先用活动窗口，避免读到下层残留页面的内容。 */
     private fun activeWindowRoot(): AccessibilityNodeInfo? {
         val root = try {
-            windows.firstOrNull { it.isActive }?.root
+            val ws = windows
+            (ws.firstOrNull { it.isActive } ?: ws.firstOrNull { it.isFocused })?.root
         } catch (e: Exception) {
             null
         }
@@ -529,6 +735,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
             hintHot = false
             hintCoolStreak = 0
         } else {
+            probeHongguoTree(rootNode)
             // 全屏时用户可能旋转屏幕：方向一变搜索带整块换位（竖屏底部 ↔ 横屏右上），
             // 旧方向的匹配不能算数；同时立刻重采样，不等低频档位。
             val bounds = currentScreenBounds()
@@ -1218,7 +1425,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
     private val splashTicker = object : Runnable {
         override fun run() {
             val now = SystemClock.elapsedRealtime()
-            if (now > splashUntil || !screenOn()) return
+            if (now > splashUntil || !screenOn() || splashPkg == null) return
             try {
                 scanSplashOnce(now)
             } catch (e: Exception) {
@@ -1271,8 +1478,15 @@ class AdSkipAccessibilityService : AccessibilityService() {
             // 红果等目标 App 已在前台时无条件停止开屏扫描：红果剧间广告的
             // 截图匹配/滑动调度与开屏轮询共用主线程，开屏轮询不退出会
             // 阻塞「命中后延迟滑动」的执行（实测 21:12 命中后滑动未执行）。
+            // 但切 App 的头几拍活动窗口还是上一个 App：实测从红果播放器冷启动小蚕，
+            // 新窗口事件后 5ms 活动窗口仍是红果，扫描当场自停，那条开屏广告再没被扫过。
+            // 给过渡 800ms 宽限，过了还停在目标 App 上才算真的没切换。
+            if (splashNodeClicks == 0 && now - splashWindowStart < 800L) return
             if (active != null && (splashNodeClicks > 0 || TARGET_PACKAGES.contains(active))) {
                 logDebug("开屏扫描停止(active=$active)")
+                // 置空 splashPkg 才能真正停：ticker 的 run() 在本函数返回后还会无条件下一次
+                // postDelayed，只 removeCallbacks 会被自己重新挂上（实测每 250ms 刷一条停止日志）
+                splashPkg = null
                 handler.removeCallbacks(splashTicker)
             }
             return
@@ -1306,6 +1520,10 @@ class AdSkipAccessibilityService : AccessibilityService() {
         }
         val node = roots.firstNotNullOfOrNull { findSplashSkipNode(it, 0, 16) }
         if (node != null) {
+            // 窗口刚出现 0.5 秒内不动手：厂商 ROM 在窗口切换的快照期会把「上一次退出时的界面」
+            // 画在新窗口上，此刻扫到的「跳过」可能是早已不存在的广告，点下去就打在新首页上。
+            val sinceStart = now - splashWindowStart
+            if (sinceStart < SPLASH_FIRST_CLICK_MS) return
             // 同一个键点过一次没反应就不再点：实测连点两下会把用户带进广告落地页
             val key = "${node.viewIdResourceName}|${node.text}|${node.contentDescription}|${node.className}"
             if (key == lastSplashClickKey) return
@@ -1317,6 +1535,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
             }
             if (clickNode(node)) {
                 splashNodeClicks++
+                if (splashNodeClicks == 1) Log.i(TAG, "开屏首击时延 +${sinceStart}ms")
                 lastSplashClickKey = key
                 lastSplashClick = SystemClock.elapsedRealtime()
                 splashClosedPending = true
@@ -1416,15 +1635,19 @@ class AdSkipAccessibilityService : AccessibilityService() {
         val text = node.text?.toString()?.trim().orEmpty()
         val desc = node.contentDescription?.toString()?.trim().orEmpty()
         val id = node.viewIdResourceName?.lowercase().orEmpty()
-        if (isCornerCountdown(node)) {
+        // 开了 flagIncludeNotImportantViews 之后，看不见的节点也会进树。
+        // 不可见的「跳过」可能是上一屏广告留下的残骸，点它等于朝空气落指、
+        // 甚至点到已经被它盖住的首页按钮上，一律不认。
+        val visible = node.isVisibleToUser
+        if (visible && isCornerCountdown(node)) {
             splashMatchInfo = "倒计时数字「${node.text ?: node.contentDescription}」"
             return node // 倒计时数字只认它自己可点，往上爬会点到广告或角标容器
         }
-        if ((isSkipLabel(text) || isSkipLabel(desc)) && isButtonSized(node)) {
+        if (visible && (isSkipLabel(text) || isSkipLabel(desc)) && node.childCount == 0 && isButtonSized(node)) {
             splashMatchInfo = "text=$text desc=$desc id=$id"
             return node // 点「跳过」这两个字本身，不去点可点的祖先（实测祖先常是广告容器）
         }
-        if (isSkipViewId(id) && isButtonSized(node)) {
+        if (visible && isSkipViewId(id) && isButtonSized(node)) {
             // 按 id 命中只许点「按钮自己」或「同样只有按钮尺寸的可点祖先」。实测晓晓优选
             // (TopOn 聚合)的 tobid_splash_skip_text 往上爬到的可点 RelativeLayout 是整块广告热区，
             // 点它直接触发深链，被 MIUI 拦成「晓晓优选 想要打开 美团」。
@@ -1475,17 +1698,29 @@ class AdSkipAccessibilityService : AccessibilityService() {
     private fun isSkipViewId(id: String): Boolean {
         if (id.isEmpty()) return false
         if (id.contains("download") || id.contains("update")) return false
-        // splash_ad / ad_container 是广告容器本身，点它等于点了广告（实测点进美团），不能当跳过键
-        return id.contains("skip_ad") || id.contains("ad_skip") || id.contains("skip_view") ||
-                id.contains("close_ad") || id.contains("skip")
+        val short = id.substringAfterLast('/')
+        // 社区验证过的具名跳过件（高置信）
+        if (SPLASH_SKIP_IDS.any { short.contains(it) }) return true
+        // 倒计时件：短名同时含 count 与 down（download 已在上面排除，挡住「点击下载」假跳过）
+        if (short.contains("count") && short.contains("down")) return true
+        // 泛匹配兜新 SDK 的命名；splash_ad / ad_container 这类广告容器名不在表里，也绝不能当跳过键
+        return short.contains("skip_ad") || short.contains("ad_skip") || short.contains("skip_view") ||
+                short.contains("close_ad") || short.contains("skip")
     }
 
-    /** 广告容器往往占满整屏，只有按钮尺寸的节点才允许按 id 盲点。 */
+    /**
+     * 只有按钮尺寸的节点才允许点。旧口径是「小于半屏宽 × 四分之一屏高」，
+     * 在 1080 屏上等于允许 540×600 —— 一块盖住大半屏的广告卡片也能过审，太松。
+     * 业界口径用绝对像素（GKD 默认订阅小关闭键 130、AIsouler 无形 View 用 200），
+     * 这里取 300×200：比业界略松（为了不丢已实测命中的 tv_skip/count_down/tobid 121×54），
+     * 但已经把「全屏热区冒充按钮」这条路从几何上切断。
+     */
     private fun isButtonSized(node: AccessibilityNodeInfo): Boolean {
         val b = Rect()
         node.getBoundsInScreen(b)
         val screen = currentScreenBounds()
-        return b.width() < screen.width() * 0.5f && b.height() < screen.height() * 0.25f
+        return b.width() in 1..300 && b.height() in 1..200 &&
+            b.width() < screen.width() * 0.28f && b.height() < screen.height() * 0.09f
     }
 
     private fun sampleList(root: AccessibilityNodeInfo, limit: Int = 12): List<String> {
