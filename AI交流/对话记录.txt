@@ -1637,3 +1637,26 @@ AI交流/T14_广告截图留存/v241/：ad_115526_139_01.png … ad_120107_824_0
   是零成本精准信号；当前 10Hz CONTENT_CHANGED 洪水让本服务在红果前台吃 33.4% 单核；
   业界（GKD/ad-auto）用 `[text=选集][visibleToUser=false]` 判广告覆盖层，不需要截图。
   四个方案与拍板问题写在文档里，等用户选。
+
+[11-01 · 深度调研（开屏+红果）出 T16 方案，等拍板]
+- 用户要求"更深更细调研别人的方案，包括开屏和红果"。四路并行调研：开屏工具（李跳跳/SKIP/GKD/ad-auto/ad-skipper）、
+  红果专项（Lin-arm/baidu0013/iz/lifeiyu/jvkal + AOSP 语义）、免 root 网络层拦截、无障碍信号面与性能。
+- 四个推翻性结论：① `isVisibleToUser` 只查本窗口可见性+祖先 alpha/visibility+祖先裁剪，
+  **不做跨窗口/兄弟遮挡、不管 SurfaceView** → T15 里"正片控件被盖住所以不可见"的机理讲错了，
+  GKD 那条 `[text="选集"][visibleToUser=false]` 能用是因为红果自己隐藏控件，只能当低置信兜底；
+  ② 缺 `flagIncludeNotImportantViews` 才是"广告不进树"的可能主因（uiautomator 默认带它，
+  解释了 10-30 那次 dump 能看到的矛盾），GKD/ad-auto/lifeiyu 三家配置都带着；
+  ③ AOSP 明文 **TYPE_WINDOW_CONTENT_CHANGED 绕过 notificationTimeout 合并、全量投递** → 10Hz 洪水
+  只能自己按 `getContentChangeTypes() & SUBTREE` 过滤（框架 AccessibilityCache 就这么用），这是砍 33.4% CPU 的主刀；
+  ④ 没有任何主流工具爬可点祖先（v2.4.5 方向被印证），但倍孜 SDK 有云控 `SKIPVIEW.randomClick`/
+  `fullScreenClick.randomClickNum=100`，点"跳过"文字本身也有概率被合成成广告点击 → 事后深链守护不能下掉。
+- 开屏拿到社区验证过的 id/文案表（穿山甲 tt_splash_skip_btn、快手 ksad_splash_*、腾讯 gdt_count_down_view、
+  TopOn tobid_splash_skip_*、华为 hiad_skip_text、倍孜 beizi_*）+ 硬约束（childCount==0 / 尺寸上限 200 与 130 /
+  `vid*="count"&&vid*="down"&&vid!*="download"` / 首点延迟 500ms 避 OEM 快照期 / actionMaximum=2 / resetMatch:'app'）。
+- 红果业界档位：首滑 `actionDelay:1000`、有文案每 ~2 秒重试、无文案盲滑 5 秒一轮、swipe 0.7h→0.3h/200ms；
+  护栏是"倒计时文字在=绝不动作"+ 正剧保护词表 + 倍速面板禁滑 + 触摸后 12 秒闸门 + 每波 8 次/45 秒上限。
+- 网络层路线判负（火山引擎 HTTPDNS 绕过 Local DNS + 广告预加载缓存 + 现存红果方案全是 root hook），
+  且会摧毁"回桌面/息屏 0 jiffies"基线 → 明确不做。激励解锁型"看广告解锁本集"跳不掉，也不做。
+- 零成本旁路待用户定：红果官方「基本功能模式」实测可去剧间中插，代价退登 + 金币/评论受限。
+- 产出：AI交流/T16_开屏与红果深度调研与改造方案.md（9 节，含 6 个探针项、P0~P3 改动清单、否决项、验收口径）。
+  关键外部证据已二次核验（Lin-arm 原文字段、gkd 默认订阅 id 计数、ad-auto 仓库时间线 2026-08-07 早于我们红果取证）。
