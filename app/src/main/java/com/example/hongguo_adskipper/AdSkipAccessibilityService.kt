@@ -1202,6 +1202,9 @@ class AdSkipAccessibilityService : AccessibilityService() {
     private var splashNodeClicks = 0
     private var lastSplashClick = 0L
     private var splashClosedPending = false
+    private var splashDetected = false
+    private var splashSkipCounted = false
+    private var splashSuccessCounted = false
     private var lastSplashScan = 0L
     private var splashTreeLogs = 0
     private var lastSplashDigest = ""
@@ -1243,6 +1246,9 @@ class AdSkipAccessibilityService : AccessibilityService() {
         splashAdStreak = 0
         splashNodeClicks = 0
         splashClosedPending = false
+        splashDetected = false
+        splashSkipCounted = false
+        splashSuccessCounted = false
         lastSplashClick = 0
         lastSplashScan = 0
         splashTreeLogs = 0
@@ -1287,7 +1293,11 @@ class AdSkipAccessibilityService : AccessibilityService() {
                 splashClosedPending = false
             } else if (gone) {
                 splashClosedPending = false
-                Counters.inc(SkipStat.SPLASH_SUCCESS)
+                // 一条开屏只记一次成功：同窗口内点两下、复核两次不重复计
+                if (!splashSuccessCounted) {
+                    splashSuccessCounted = true
+                    Counters.inc(SkipStat.SPLASH_SUCCESS)
+                }
                 logDebug("开屏已关闭")
             }
         }
@@ -1297,12 +1307,20 @@ class AdSkipAccessibilityService : AccessibilityService() {
             val key = "${node.viewIdResourceName}|${node.text}|${node.contentDescription}|${node.className}"
             if (key == lastSplashClickKey) return
             if (splashNodeClicks >= SPLASH_NODE_MAX) return
+            // 认出可点的跳过控件就算「检测」：一条开屏只算一次，点两下不重复计
+            if (!splashDetected) {
+                splashDetected = true
+                Counters.inc(SkipStat.SPLASH_DETECT)
+            }
             if (clickNode(node)) {
                 splashNodeClicks++
                 lastSplashClickKey = key
                 lastSplashClick = SystemClock.elapsedRealtime()
                 splashClosedPending = true
-                Counters.inc(SkipStat.SPLASH_SKIP)
+                if (!splashSkipCounted) {
+                    splashSkipCounted = true
+                    Counters.inc(SkipStat.SPLASH_SKIP)
+                }
                 val label = node.text?.toString()?.take(8)
                     ?: node.contentDescription?.toString()?.take(8)
                     ?: node.viewIdResourceName?.substringAfterLast('/')
@@ -1319,7 +1337,10 @@ class AdSkipAccessibilityService : AccessibilityService() {
         // 广告特征连续两拍才认，避免普通页面里一两个“广告”字样就续期
         val confirmedAd = splashAdStreak >= 2
         if (confirmedAd) {
-            if (splashAdStreak == 2) Counters.inc(SkipStat.SPLASH_DETECT)
+            if (!splashDetected) {
+                splashDetected = true
+                Counters.inc(SkipStat.SPLASH_DETECT)
+            }
             splashUntil = maxOf(splashUntil, now + SPLASH_RENEW_MS)
         }
         val digest = samples.joinToString("/")
@@ -1345,6 +1366,9 @@ class AdSkipAccessibilityService : AccessibilityService() {
             for (w in windows) {
                 val root = w.root ?: continue
                 if (root.packageName?.toString() != pkg) continue
+                // 同一个 App 的后台窗口也留在窗口并集里：实测在 B站 搜索页点到了
+                // 退到后台的视频窗口残留的「跳过」倒计时。看不见的窗口不该点。
+                if (!w.isActive && !w.isFocused) continue
                 if (!out.contains(root)) out.add(root)
             }
         } catch (e: Exception) {
