@@ -235,12 +235,10 @@ class MainActivity : AppCompatActivity() {
         tvLog.text = if (logs.isEmpty()) "等待事件…" else logs.joinToString("\n")
     }
 
-    /** 省电/速度档位说明：随进度条实时更新。时延按真实链路算——
-     *  等下一次采样（0～采样间隔）+ 0.8 秒二次确认 + 1.2 秒后滑动。 */
+    /** 省电/速度档位说明：随进度条实时更新。红果改走无障碍树之后，档位只影响
+     *  「无广告迹象时的兜底轮询间隔」，广告本身靠界面事件即时判定（220ms 一拍，两拍确认）。 */
     private fun updatePerfHint(p: Int) {
-        val coolMs = (2600 - p * 24).coerceIn(900, 2600)
-        val fast = formatSeconds(2.0f)
-        val slow = formatSeconds((coolMs + 2000) / 1000f)
+        val pollMs = (1800 - p * 10).coerceIn(900, 1800)
         val mode = when {
             p <= 20 -> "很省电"
             p <= 45 -> "偏省电"
@@ -248,7 +246,8 @@ class MainActivity : AppCompatActivity() {
             p <= 90 -> "偏快"
             else -> "最快"
         }
-        tvPerfHint.text = "$mode：平时 ${formatSeconds(coolMs / 1000f)} 扫一次，广告出现后 $fast–$slow 跳过"
+        tvPerfHint.text = "$mode：无广告时 ${formatSeconds(pollMs / 1000f)} 兜底扫一次；" +
+            "红果广告出现后约 2 秒划走"
     }
 
     private fun formatSeconds(s: Float): String {

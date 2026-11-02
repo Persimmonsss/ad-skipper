@@ -24,6 +24,9 @@ import android.view.Display
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 
 /**
  * 红果短剧广告自动跳过 + 监控数据采集 v1.2.0
@@ -90,12 +93,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
         private const val HINT_SCORE = 0.85f
         // 模板素材采集机：Mi 10 1080×2340、440dpi、density=2.75。别的机型按密度比缩放模板
         private const val HINT_REF_DENSITY = 2.75f
-        // 采样/轮询间隔随 Settings.perfLevel 动态变化（0=省电 100=最快），见下方 hintSampleCool() 等
-        private const val HINT_STREAK_NEED = 2
-        // 连续 N 拍毫无广告迹象后从高频回到低频
-        private const val HINT_COOL_STREAK_RESET = 3
-        // 广告迹象确认期 0.8s（命中后的关键路径）；系统截图最小间隔 333ms，700ms 留足余量
-        private const val HINT_SAMPLE_HOT_MS = 800L
+        // 结构/文案判据都要两拍，防住切页瞬间的过渡布局刚好凑齐特征
+        private const val STRUCT_STREAK_NEED = 2
         private const val SHOT_MIN_GAP_MS = 700L
         // 红果跳过后的撤回气泡停留时长
         private const val UNDO_BUBBLE_MS = 5000L
@@ -213,8 +212,6 @@ class AdSkipAccessibilityService : AccessibilityService() {
         private var consecutiveSwipes = 0
         private var lastAdDetectedTime = 0L
         private var wasAdBeforeSwipe = false
-        private var hintStreak = 0
-        private var lastHintSampleAt = 0L
         private var lastShotAt = 0L
         private var darkSampleInFlight = false
         // 广告深链兜底：滑动后 5 秒内前台被广告顶到别的 App，立刻返回红果
@@ -226,21 +223,25 @@ class AdSkipAccessibilityService : AccessibilityService() {
         // ===== 红果取证探针（只打日志，不参与任何判定与手势）=====
         // 事件位直方图：TYPE_WINDOW_CONTENT_CHANGED 的 contentChangeTypes 各位计数
         private const val PROBE_FLUSH_MS = 5000L
-        private const val PROBE_TREE_MS = 4000L
-        private const val PROBE_TREE_MAX = 200
         private val probeContentBits = HashMap<Int, Int>()
         private var probeScrolled = 0
         private var probeFlushAt = 0L
-        private var probeTreeAt = 0L
-        private var probeTreeLogs = 0
         private var probeBeatAt = 0L
-        // 正片控件：GKD 红果规则用它们的「在树里但不可见」反推广告压在上面，这里实测到底可不可见。
-        // 词表照抄 ad-auto 的 PLAYBACK_CONTROL_KEYWORDS（正剧播放特征，出现即绝不滑）
-        private val PROBE_MARKS = listOf(
-            "选集", "倍速", "热评", "剧评", "评论", "分享", "暂停", "下一集", "全屏观看", "剧备字",
-            "追剧", "展开", "全集", "已完结", "作者声明", "跟播", "点赞", "收藏", "弹幕"
-        )
-        private val PROBE_EP = Regex("第\\d+集")
+        // 分区签名心跳：4 秒一行，用来在真机上复核判据没漂
+        private var zoneLogAt = 0L
+        private var zoneLastSign = -1
+
+        // 结构判据采样间隔：红果广告动画能推到 150ms 一个事件，不节流就是每秒四五次全树遍历，
+        // 主线程被压死后「已执行滑动」会拖到十几秒后才跑（实测广告出现到划走隔了 36 秒）。
+        private const val STRUCT_SAMPLE_MS = 220L
+        // 单次遍历的节点上限，挡住异常深的树
+        private const val ZONE_NODE_CAP = 900
+        // 广告签名要连续挂够这么久才算广告：切集动画的瞬态只活 ~1 秒，广告一挂几十秒
+        private const val STRUCT_HOLD_MS = 1500L
+        // 竖屏广告自带「上滑继续观看短剧」文案，是广告层自己的话，不用等那么久
+        private const val HINT_HOLD_MS = 700L
+        // 追拍上限：12 × 220ms ≈ 2.6 秒，够确认一次，又不会变成常驻轮询
+        private const val STRUCT_NUDGE_MAX = 12
 
         private val handler = Handler(Looper.getMainLooper())
     }
@@ -253,11 +254,31 @@ class AdSkipAccessibilityService : AccessibilityService() {
     // 倒计时锁定型广告的快速重试状态（复核失败时进入，成功或放弃后退出）
     private var retryingAd = false
     private var lockRetries = 0
-    // 红果采样两档：有广告迹象时高频，正常播放回低频省电
-    private var hintHot = false
-    private var hintCoolStreak = 0
     // 上一次采样的屏幕方向：旋转后搜索带/手势坐标整体换向，连续匹配不能跨方向累计
     private var lastLandscape: Boolean? = null
+    // 结构判据连续拍数（零截图主链路）
+    private var structStreak = 0
+    // 上一次做全树采样的时刻（事件比采样密的时候丢掉多余遍历，保住主线程）
+    private var structSampleAt = 0L
+    // 本轮广告签名第一次出现的时刻（0 = 当前没有签名），用来量「挂了多久」
+    private var structAdSince = 0L
+    // 签名挂上后自己追拍的次数（静态广告不再推 CONTENT_CHANGED，只等事件确认要 2 秒）
+    private var structNudges = 0
+    private val structNudge = Runnable {
+        val root = activeWindowRoot()
+        if (root != null && root.packageName?.toString() in HONGGUO_PACKAGES) {
+            processScreen(root, System.currentTimeMillis())
+        } else {
+            structNudges = 0
+        }
+    }
+    // 本轮是否已记过成功（每次新命中重置）
+    private var successCounted = false
+    // 截图分析专用单线程：全屏位图转换 + NCC 匹配实测 150~335ms，压在无障碍主回调线程上
+    // 会同时堵住事件处理和手势派发，改成串行工作线程后主线程只负责收 buffer 和判定
+    private val shotExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "hg-shot")
+    }
     private val biliUi by lazy { BiliUiSkip(this, biliBubble) }
 
     // 前台包名：红果不在前台时不做轮询（省电）
@@ -310,7 +331,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
         isServiceEnabled = true
         foregroundPkg = activeWindowPackage()
         foregroundAt = SystemClock.elapsedRealtime()
-        hintStreak = 0
+        structStreak = 0
+        structAdSince = 0L
         createNotificationChannel()
         showNotification()
         handler.removeCallbacks(periodicCheck)
@@ -540,64 +562,89 @@ class AdSkipAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * 树侧探针：正片控件（选集/倍速/第X集…）在广告压住时到底是「不可见」还是「整棵被剥掉」，
-     * 以及「上滑继续看短剧」这类文案能不能直接搜到。这是零截图判定的生死判据。
+     * 分区签名日志：判定翻转或 4 秒心跳时落一行。
+     * Mi 10（2340×1080）实测横屏只有剧间广告会同时凑齐三区：
+     *   剧间广告   上左=2 上右=5 底条=1~2 广告角标=true  → 判定 1
+     *   正片播放   上左=0 上右=0 底条=0                 → 0
+     *   选集/倍速  上左=1 上右=0 底条=0                 → 0
+     *   首页信息流 上左=9 上右=0 底条=0                 → 0
+     * 广告层挂在树深 21~23 层，早先「广告一个字都不进树」是被 15/18 层截断坑了。
      */
-    private fun probeHongguoTree(rootNode: AccessibilityNodeInfo) {
+    private fun probeZones(sig: ZoneSig) {
         val now = SystemClock.elapsedRealtime()
-        if (now - probeTreeAt < PROBE_TREE_MS || probeTreeLogs >= PROBE_TREE_MAX) return
-        probeTreeAt = now
-        probeTreeLogs++
-        val marks = LinkedHashSet<String>()
-        var texts = 0
-        var scrollable = 0
-        var surfaces = 0
-        var adItem = 0
-        var renderView = false
-        fun walk(n: AccessibilityNodeInfo, d: Int) {
-            if (d > 18) return
-            val t = n.text?.toString()?.trim().orEmpty()
-            val label = if (t.isNotEmpty()) t else n.contentDescription?.toString()?.trim().orEmpty()
-            if (label.isNotEmpty()) {
-                texts++
-                val name = PROBE_MARKS.firstOrNull { label.contains(it) }
-                    ?: if (PROBE_EP.containsMatchIn(label)) label.take(6) else null
-                if (name != null && marks.size < 12) {
-                    val b = Rect()
-                    n.getBoundsInScreen(b)
-                    marks.add("$name${if (n.isVisibleToUser) "V" else "-"}${b.width()}x${b.height()}")
-                }
-            }
-            if (n.isScrollable) scrollable++
-            val cls = n.className?.toString().orEmpty()
-            if (cls.endsWith("SurfaceView") || cls.endsWith("TextureView")) surfaces++
-            // ad-auto 实测：三种广告形态的树里都同时有 ay0+i0t，84 个正剧 id 里两个都没有
-            when (n.viewIdResourceName?.substringAfterLast('/')) {
-                "ay0", "i0t" -> adItem++
-                "ttlive_player_render_view" -> renderView = true
-            }
-            for (i in 0 until n.childCount) n.getChild(i)?.let { walk(it, d + 1) }
-        }
-        walk(rootNode, 0)
-        val up = try {
-            rootNode.findAccessibilityNodeInfosByText("上滑").count { it.isVisibleToUser }
-        } catch (e: Exception) { -1 }
-        Log.d(TAG, "探针·树#$probeTreeLogs 文案$texts 上滑可见=$up ay0i0t=$adItem 渲染=$renderView " +
-            "可滚=$scrollable 表面对象=$surfaces 控件[${marks.joinToString(" ")}] 窗口[${probeWindowBrief()}]")
+        val sign = if (sig.adScreen) 1 else 0
+        if (sign == zoneLastSign && now - zoneLogAt < 4000L) return
+        zoneLogAt = now
+        zoneLastSign = sign
+        Log.d(TAG, "探针Z 上左=${sig.ul} 上右=${sig.ur} 底中=${sig.bm} 底条=${sig.bb} " +
+            "可见=${sig.vis} 横屏=${sig.landscape} 播放器控件=${sig.playerUi} 判广告=$sign 文案[${sig.texts.take(5).joinToString(" ")}]")
     }
 
-    /** 便宜版窗口清单：只读 type/active/focused/包名，不遍历文案。 */
-    private fun probeWindowBrief(): String {
-        val parts = ArrayList<String>()
-        try {
-            for (w in windows) {
-                parts.add("${w.type}${if (w.isActive) "A" else ""}${if (w.isFocused) "F" else ""}" +
-                    ":${w.root?.packageName?.toString()?.substringAfterLast('.') ?: "-"}")
+    /**
+     * 一次遍历同时拿到分区签名和屏上文案：子节点要跨进程取，text/边界是随节点一起回来的
+     * 快照字段，顺路读几乎免费 —— 所以屏上信息只数这一棵树，不再单独跑文案遍历。
+     * 剪枝依据是 isVisibleToUser 沿父链继承：父不可见整棵子树都不可能被看到。
+     */
+    private fun zoneSignature(rootNode: AccessibilityNodeInfo): ZoneSig? {
+        val sb = currentScreenBounds()
+        val sw = sb.width().toFloat()
+        val sh = sb.height().toFloat()
+        if (sw <= 0f || sh <= 0f) return null
+        var ul = 0   // 左上小件（返回箭头）
+        var ur = 0   // 右上小件（上滑胶囊）
+        var bm = 0   // 底部中间小件
+        var bb = 0   // 底部通栏横条（广告操作条）
+        var vis = 0
+        var seen = 0
+        var playerUi = false
+        var hintText = false
+        val texts = ArrayList<String>(24)
+        fun walk(n: AccessibilityNodeInfo, d: Int) {
+            if (d > 30 || seen >= ZONE_NODE_CAP) return
+            seen++
+            if (!n.isVisibleToUser) return
+            vis++
+            val label = n.text?.toString()?.trim()?.ifEmpty { null }
+                ?: n.contentDescription?.toString()?.trim()?.ifEmpty { null }
+            if (label != null) {
+                // 竖屏要有这条才敢判广告：信息流/详情页的播放器控件在树里但不可见，
+                // 只有真在播放页才会「全屏观看」可见（实测 00:04:47 信息流广告卡片就是靠这条挡掉的）
+                if (label.contains("全屏观看")) playerUi = true
+                // 广告层自己写进树里的提示条：竖屏「上滑继续观看短剧」，横屏同理带这条
+                if (label.contains("上滑继续")) hintText = true
+                if (texts.size < 24) texts.add(label)
             }
-        } catch (e: Exception) {
-            parts.add("err")
+            val b = Rect()
+            n.getBoundsInScreen(b)
+            val w = (b.right - b.left).toFloat()
+            val h = (b.bottom - b.top).toFloat()
+            if (w > 0f && h > 0f) {
+                val cx = (b.left + b.right) / 2f
+                val cy = (b.top + b.bottom) / 2f
+                val area = w * h
+                // 最小件尺寸：树里常驻一个 1×1 的 View/fj（所有状态都有），不过滤会永远算成「左上小件」
+                val big = w >= 0.03f * sh && h >= 0.03f * sh
+                if (big && cx < 0.20f * sw && cy < 0.22f * sh && area <= 0.02f * sw * sh) ul++
+                if (big && cx > 0.60f * sw && cy < 0.22f * sh && area <= 0.06f * sw * sh) ur++
+                if (big && cx in 0.30f * sw..0.70f * sw && cy >= 0.80f * sh &&
+                    area <= 0.06f * sw * sh
+                ) bm++
+                if (w >= 0.88f * sw && h <= 0.30f * sh && b.bottom >= 0.94f * sh) bb++
+            }
+            for (i in 0 until n.childCount) {
+                if (seen >= ZONE_NODE_CAP) break
+                n.getChild(i)?.let { walk(it, d + 1) }
+            }
         }
-        return parts.joinToString(",")
+        walk(rootNode, 0)
+        val sig = ZoneSig(ul, ur, bm, bb, vis, false, sw > sh, playerUi, hintText, texts)
+        // 「广告」合规角标只在判据已经成立后才查：findAccessibilityNodeInfosByText 是跨进程查询，
+        // 每个事件都问一遍是主线程被拖死的原因之一。
+        return if (!sig.adScreen) sig else sig.copy(adTag = try {
+            rootNode.findAccessibilityNodeInfosByText("广告").any { it.isVisibleToUser }
+        } catch (e: Exception) {
+            false
+        })
     }
 
     // ==================== 定时轮询 ====================
@@ -698,12 +745,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
 
     // ==================== 省电/速度档位 ====================
     // 用户在主界面用进度条在「跳广告速度 ↔ 省电」之间选择（Settings.perfLevel 0~100）。
-    // 档位只影响「无广告迹象时的采样频率」与「轮询兜底频率」；
-    // 广告一旦确认（提示条 ≥0.85），确认与滑动链路固定 0.8s+1.2s 不随档位变慢。
-
-    /** 正常播放（无广告迹象）时的红果采样间隔：速度端 0.9s，省电端 2.6s。 */
-    private fun hintSampleCool(): Long =
-        (2600 - Settings.perfLevel * 24).coerceIn(900, 2600).toLong()
+    // 档位只影响「无广告迹象时的轮询兜底频率」；红果判定改走无障碍树后，
+    // 关键路径固定在事件到达后的 220ms 采样拍上，不再随档位变慢。
 
     /** 目标 App 前台轮询兜底间隔：速度端 0.9s，省电端 1.8s。 */
     private fun checkIntervalActive(): Long =
@@ -715,74 +758,95 @@ class AdSkipAccessibilityService : AccessibilityService() {
 
     // ==================== 核心处理：采集 + 检测广告 ====================
 
+    /**
+     * 广告签名挂上后自己追一拍：静态广告不再推 CONTENT_CHANGED，只等事件的话
+     * 实测第 2 拍要 1.9 秒后才来（00:50:56.310），确认时延全压在事件密度上。
+     */
+    private fun scheduleStructNudge() {
+        if (structNudges >= STRUCT_NUDGE_MAX) return
+        structNudges++
+        handler.removeCallbacks(structNudge)
+        handler.postDelayed(structNudge, STRUCT_SAMPLE_MS)
+    }
+
+    private fun stopStructNudge() {
+        structNudges = 0
+        handler.removeCallbacks(structNudge)
+    }
+
     private fun processScreen(rootNode: AccessibilityNodeInfo, currentTime: Long) {
         screenCheckCount++
-
-        // 1. 采集屏幕所有文字
-        val allTexts = mutableListOf<String>()
-        collectAllTexts(rootNode, allTexts, 0, 15)
-        lastScreenTexts = allTexts
-
-        // 2. 提取短剧信息
-        extractDramaInfo(allTexts)
-
-        // 3. 检测广告
         val pkg = rootNode.packageName?.toString().orEmpty()
-        if (pkg !in HONGGUO_PACKAGES) {
+        val hongguo = pkg in HONGGUO_PACKAGES
+
+        // 一次全树遍历同时给出分区签名和屏上文案（文案随节点快照回来，不再单独走一棵树）。
+        // 广告动画期事件能密到 150ms 一条，按 STRUCT_SAMPLE_MS 采：两拍确认 ~0.5 秒，
+        // 又能把主线程留给手势派发 —— 之前每秒四五次全树遍历，划动手势被拖到 30 秒后才跑。
+        val beat = SystemClock.elapsedRealtime()
+        var sig: ZoneSig? = null
+        if (beat - structSampleAt >= STRUCT_SAMPLE_MS) {
+            structSampleAt = beat
+            sig = zoneSignature(rootNode)
+            if (sig != null) {
+                lastScreenTexts = sig.texts
+                extractDramaInfo(sig.texts)
+                if (hongguo) probeZones(sig)
+            }
+        }
+
+        if (!hongguo) {
             // 红果不在前台时采样链停摆，残留的「连续匹配」必须清掉：实测切出 27 秒再切回，
             // 旧 streak 会让回来后的第一帧直接凑成第 2 拍（单帧确认，遇过渡画面就可能误滑）
-            hintStreak = 0
-            hintHot = false
-            hintCoolStreak = 0
-        } else {
-            probeHongguoTree(rootNode)
-            // 全屏时用户可能旋转屏幕：方向一变搜索带整块换位（竖屏底部 ↔ 横屏右上），
-            // 旧方向的匹配不能算数；同时立刻重采样，不等低频档位。
-            val bounds = currentScreenBounds()
-            val landscapeNow = bounds.width() > bounds.height()
-            if (lastLandscape != null && lastLandscape != landscapeNow) {
-                hintStreak = 0
-                hintHot = false
-                hintCoolStreak = 0
-                lastHintSampleAt = 0
-                logDebug("方向切换 ${if (landscapeNow) "横屏" else "竖屏"}，重新采样")
+            structStreak = 0
+            structAdSince = 0L
+            stopStructNudge()
+        } else if (sig != null) {
+            // 全屏时用户可能旋转屏幕：方向一变两套判据整体换向，旧方向的计数不能算数
+            if (lastLandscape != null && lastLandscape != sig.landscape) {
+                structStreak = 0
+                structAdSince = 0L
+                stopStructNudge()
+                logDebug("方向切换 ${if (sig.landscape) "横屏" else "竖屏"}，重新计数")
             }
-            lastLandscape = landscapeNow
+            lastLandscape = sig.landscape
         }
         // 倒计时重试循环进行中：红果还在同一广告页，轮询不再重复触发（避免耗尽连续滑动预算）
         if (retryingAd) return
-        if (pkg in HONGGUO_PACKAGES && currentTime - lastHintSampleAt >= if (hintHot) HINT_SAMPLE_HOT_MS else hintSampleCool()) {
-            // 红果剧间广告画在自家窗口里，无障碍树原样留着上一集的 60 多条文案
-            //（实测：「第12集/选集/评论」全在，广告自身一个字都不进树），文字判定必然误伤。
-            // 唯一稳定的画面标记是广告层底部的「上滑继续看短剧」提示，按模板匹配认它。
-            lastHintSampleAt = currentTime
-            sampleScreenMatch { score ->
-                if (score < 0f) return@sampleScreenMatch
-                if (score >= HINT_SCORE) {
-                    hintHot = true
-                    hintStreak++
-                    logDebug("提示条匹配 ${(score * 100).toInt()}% 第${hintStreak}拍")
-                    if (hintStreak >= HINT_STREAK_NEED) {
-                        hintStreak = 0
-                        onAdDetected("上滑继续看短剧", System.currentTimeMillis())
-                    }
-                } else if (score >= 0.6f) {
-                    // 有广告迹象但未达阈值：进入高频，等它变清晰
-                    hintHot = true
-                    hintCoolStreak = 0
-                    hintStreak = 0
-                    logDebug("提示条近似 ${(score * 100).toInt()}%")
-                } else {
-                    hintStreak = 0
-                    hintCoolStreak++
-                    if (hintCoolStreak >= HINT_COOL_STREAK_RESET) {
-                        hintCoolStreak = 0
-                        hintHot = false
-                    }
+        // 零截图主链路：广告层是原生 View，一次全树遍历就能看出它挂上来了。
+        // · 横屏没有可读文案，靠分区几何（左上返回 + 右上「上滑」胶囊 + 底部通栏条三区齐）；
+        //   竖屏额外要求「全屏观看」可见，证明画面在播放器里而不是信息流。
+        // · 竖屏广告层自带「上滑继续观看短剧」提示条，这是广告自己写进树里的话，
+        //   38 拍实测恒为 上右3~4 底条4 可见74（正片播放 上右2 底条0 可见131），配 700ms 就够。
+        // · 还要连续挂够：实测切集动画那一拍会短暂凑齐三区
+        //（00:29:59 竖屏 上左3 上右12 底条2 可见202，只活了 1 秒），广告则一挂几十秒。
+        // 宁可漏跳也不能在信息流里误划 —— 快速上滑曾被广告卡片吃成深链。
+        if (sig != null) {
+            val byText = sig.verticalAd
+            if (sig.adScreen) {
+                if (structAdSince == 0L) structAdSince = beat
+                structStreak++
+                val held = beat - structAdSince
+                val need = if (byText) HINT_HOLD_MS else STRUCT_HOLD_MS
+                logDebug(
+                    "结构广告层 第${structStreak}拍 已挂${held}ms " +
+                        (if (byText) "提示条文案 上右${sig.ur} 底条${sig.bb}" else "上左${sig.ul} 上右${sig.ur} 底条${sig.bb}") +
+                        if (sig.adTag) " 带广告角标" else ""
+                )
+                if (held >= need && structStreak >= STRUCT_STREAK_NEED) {
+                    structStreak = 0
+                    structAdSince = 0L
+                    stopStructNudge()
+                    onAdDetected(if (byText) "上滑继续看短剧" else "结构:广告层", currentTime)
+                    return
                 }
+                scheduleStructNudge()
+            } else {
+                structStreak = 0
+                structAdSince = 0L
+                stopStructNudge()
             }
         }
-        val detected = detectAdFor(pkg, allTexts)
+        val detected = detectAdFor(pkg, sig?.texts ?: lastScreenTexts)
         if (detected) {
             onAdDetected(lastAdKeyword, currentTime)
         } else {
@@ -809,7 +873,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
         }
         lastAdKeyword = keyword
         Counters.inc(SkipStat.HG_DETECT)
-        hintStreak = 0
+        successCounted = false
         lastAdDetectedTime = currentTime
         lastAdTime = formatTime(currentTime)
         consecutiveSwipes++
@@ -1133,26 +1197,44 @@ class AdSkipAccessibilityService : AccessibilityService() {
         try {
             takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor, object : TakeScreenshotCallback {
                 override fun onSuccess(result: ScreenshotResult) {
+                    val cbAt = SystemClock.elapsedRealtime()
                     darkSampleInFlight = false
-                    var score = 0f
+                    val buffer = result.hardwareBuffer
+                    // 回图可以晚到 2 分钟，这期间 onDestroy 已经把线程池关了，
+                    // 往 terminated 的池投递会抛 RejectedExecutionException 直接把服务打挂，
+                    // MIUI 随之把无障碍开关关掉 —— 之后一条广告都跳不了。
                     try {
-                        val hw = Bitmap.wrapHardwareBuffer(result.hardwareBuffer, result.colorSpace)
-                        val sw = hw?.copy(Bitmap.Config.ARGB_8888, false)
-                        if (sw != null) {
-                            val t0 = SystemClock.elapsedRealtime()
-                            score = matchHint(sw)
-                            val cost = SystemClock.elapsedRealtime() - t0
-                            // 只在有广告迹象时记耗时：正常播放每拍都打日志既费电又淹没关键行
-                            if (score >= 0.6f) {
-                                logDebug("采样 截图${SystemClock.elapsedRealtime() - shotAt}ms 匹配${cost}ms 分数 ${(score * 100).toInt()}%")
+                        shotExecutor.execute {
+                            var score = 0f
+                            var convMs = 0L
+                            var matchMs = 0L
+                            try {
+                                val t0 = SystemClock.elapsedRealtime()
+                                val hw = Bitmap.wrapHardwareBuffer(buffer, result.colorSpace)
+                                val sw = hw?.copy(Bitmap.Config.ARGB_8888, false)
+                                hw?.recycle()
+                                val t1 = SystemClock.elapsedRealtime()
+                                convMs = t1 - t0
+                                if (sw != null) {
+                                    score = matchHint(sw)
+                                    matchMs = SystemClock.elapsedRealtime() - t1
+                                    sw.recycle()
+                                }
+                            } catch (e: Exception) {
+                                Log.w(TAG, "截图分析失败: ${e.message}")
+                            } finally {
+                                buffer.close()
+                            }
+                            val s = score
+                            handler.post {
+                                // 取证期每拍都打：回图慢是系统等 SurfaceFlinger，转图/匹配慢才是我们自己的账
+                                logDebug("采样链路 回图${cbAt - shotAt}ms 转图${convMs}ms 匹配${matchMs}ms 分数 ${(s * 100).toInt()}%")
+                                onResult(s)
                             }
                         }
-                    } catch (e: Exception) {
-                        Log.w(TAG, "截图分析失败: ${e.message}")
-                    } finally {
-                        result.hardwareBuffer.close()
+                    } catch (e: RejectedExecutionException) {
+                        buffer.close()
                     }
-                    onResult(score)
                 }
 
                 override fun onFailure(errorCode: Int) {
@@ -1169,7 +1251,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * 检查滑动结果：广告页是无障碍树里看不出来的覆盖层，复核同样按画面判。
+     * 滑动后复核：横屏直接读结构签名（毫秒级、零截图），竖屏没有可用的结构判据才退回画面。
      */
     private fun checkSwipeResult(attempt: Int = 0) {
         // 滑动 + 复核一共延了 3.2 秒，用户可能已经按了电源；息屏时截图既没意义也费电
@@ -1183,6 +1265,11 @@ class AdSkipAccessibilityService : AccessibilityService() {
             return
         }
 
+        val sig = zoneSignature(rootNode)
+        if (sig != null && sig.decidable) {
+            handleSwipeCheck(sig.adScreen, "结构 上左${sig.ul} 上右${sig.ur} 底条${sig.bb}")
+            return
+        }
         sampleScreenMatch { score ->
             // 没取到画面（撞帧/系统限流）：重试，不记成功也不记失败
             if (score < 0f) {
@@ -1194,45 +1281,52 @@ class AdSkipAccessibilityService : AccessibilityService() {
                 }
                 return@sampleScreenMatch
             }
-            val stillAd = score >= HINT_SCORE
-            if (stillAd) {
-                Counters.inc(SkipStat.HG_FAIL)
-                // 倒计时锁定型广告：红果开头锁定上滑（x 秒后可划），首滑无效是正常的。
-                // 复核失败进入快速重试循环（绕过 3 秒节流），倒计时一结束立即划走。
-                if (!retryingAd) {
-                    retryingAd = true
-                    lockRetries = 0
-                    logDebug("滑动可能失败，进入倒计时重试（提示条 ${(score * 100).toInt()}%）")
-                }
-                if (lockRetries < LOCK_RETRY_MAX) {
-                    lockRetries++
-                    val delay = if (lockRetries <= 3) RETRY_DELAY_MS else RETRY_DELAY_MS * 3
-                    logDebug("锁定重试 第${lockRetries}次（${delay}ms 后）")
-                    handler.postDelayed({
-                        if (screenOn() && TARGET_PACKAGES.contains(activeWindowPackage())) {
-                            if (performSwipeUp()) {
-                                showUndoBubble(lockRetries.toLong())
-                                handler.postDelayed({ checkSwipeResult() }, 2000)
-                            } else {
-                                retryingAd = false
-                            }
+            handleSwipeCheck(score >= HINT_SCORE, "提示条 ${(score * 100).toInt()}%")
+        }
+    }
+
+    /** 复核结论落地：还在广告就进倒计时重试，已经离开就记一次成功。 */
+    private fun handleSwipeCheck(stillAd: Boolean, reason: String) {
+        if (stillAd) {
+            // 倒计时锁定型广告：红果开头锁定上滑（x 秒后可划），首滑无效是正常的。
+            // 复核失败进入快速重试循环（绕过 3 秒节流），倒计时一结束立即划走。
+            if (!retryingAd) {
+                Counters.inc(SkipStat.HG_FAIL)   // 一条广告的连续失败只记一次
+                retryingAd = true
+                lockRetries = 0
+                logDebug("滑动可能失败，进入倒计时重试（$reason）")
+            }
+            if (lockRetries < LOCK_RETRY_MAX) {
+                lockRetries++
+                val delay = if (lockRetries <= 3) RETRY_DELAY_MS else RETRY_DELAY_MS * 3
+                logDebug("锁定重试 第${lockRetries}次（${delay}ms 后）")
+                handler.postDelayed({
+                    if (screenOn() && TARGET_PACKAGES.contains(activeWindowPackage())) {
+                        if (performSwipeUp()) {
+                            showUndoBubble(lockRetries.toLong())
+                            handler.postDelayed({ checkSwipeResult() }, 2000)
                         } else {
                             retryingAd = false
                         }
-                    }, delay)
-                } else {
-                    retryingAd = false
-                    lockRetries = 0
-                    logDebug("倒计时重试 ${LOCK_RETRY_MAX} 次仍失败，放弃，交给轮询")
-                }
+                    } else {
+                        retryingAd = false
+                    }
+                }, delay)
             } else {
-                Counters.inc(SkipStat.HG_SUCCESS)
                 retryingAd = false
                 lockRetries = 0
-                logDebug("滑动成功，已离开广告（残留 ${(score * 100).toInt()}%）")
+                logDebug("倒计时重试 ${LOCK_RETRY_MAX} 次仍失败，放弃，交给轮询")
             }
-            sendStatsBroadcast()
+        } else if (!successCounted) {
+            // 同一轮里「命中后的复核」和「重试的复核」会同时到达（实测 11ms 内两条），
+            // 一条广告只记一次成功，否则成功数会盖过检测数
+            successCounted = true
+            Counters.inc(SkipStat.HG_SUCCESS)
+            retryingAd = false
+            lockRetries = 0
+            logDebug("滑动成功，已离开广告（$reason）")
         }
+        sendStatsBroadcast()
     }
 
     // ==================== 短剧信息提取 ====================
@@ -1771,6 +1865,39 @@ class AdSkipAccessibilityService : AccessibilityService() {
         isServiceEnabled = false
         handler.removeCallbacks(periodicCheck)
         handler.removeCallbacks(biliTicker)
+        handler.removeCallbacks(structNudge)
+        shotExecutor.shutdownNow()
         Log.d(TAG, "服务已销毁")
     }
+}
+
+/**
+ * 无障碍树分区签名：四个几何区里「可见」的节点数 + 两条关键文案，全部按屏幕宽高归一化，与分辨率无关。
+ * 横屏剧间广告没有可读文案，只能靠几何（左上返回 + 右上「上滑」胶囊 + 底部通栏条三区齐）；
+ * 竖屏剧间广告自带「上滑继续观看短剧」提示条，且会把播放器的「全屏观看」整块盖掉。
+ */
+private data class ZoneSig(
+    val ul: Int,
+    val ur: Int,
+    val bm: Int,
+    val bb: Int,
+    val vis: Int,
+    val adTag: Boolean,
+    val landscape: Boolean,
+    val playerUi: Boolean,
+    val hintText: Boolean,
+    val texts: List<String>
+) {
+    /** 横屏广告层的分区几何：左上返回 + 右上「上滑」胶囊 + 底部通栏条三区齐 */
+    val adLike: Boolean get() = ul >= 1 && ur >= 1 && bb >= 1
+
+    /** 竖屏广告层：自带「上滑继续…」提示条，且播放器控件整块被盖住
+     *  （实测 4 次广告恒为 上右3~8 底条4~5 可见74~103 且「全屏观看」不可见；
+     *   正片播放 上右2 底条0 可见131；广告退场那一拍 上右2 底条2 可见160 且「全屏观看」已回到树上） */
+    val verticalAd: Boolean get() = !landscape && hintText && !playerUi && ur >= 3 && bb >= 3
+
+    val adScreen: Boolean get() = (landscape && adLike) || verticalAd
+
+    /** 结构签名能否独立判定这一屏（判不了才允许退回截图复核） */
+    val decidable: Boolean get() = landscape || playerUi || hintText
 }
