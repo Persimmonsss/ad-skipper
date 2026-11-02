@@ -247,7 +247,7 @@ class MainActivity : AppCompatActivity() {
             else -> "最快"
         }
         tvPerfHint.text = "$mode：无广告时 ${formatSeconds(pollMs / 1000f)} 兜底扫一次；" +
-            "红果广告出现后约 2~3 秒划走"
+            "红果广告出现后约 1~2 秒划走"
     }
 
     private fun formatSeconds(s: Float): String {

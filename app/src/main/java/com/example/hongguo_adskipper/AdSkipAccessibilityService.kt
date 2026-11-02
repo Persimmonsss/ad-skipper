@@ -83,7 +83,9 @@ class AdSkipAccessibilityService : AccessibilityService() {
         private val RE_CLOCK3 = Regex("""\d{1,2}:\d{2}:\d{2}""")
         private val RE_AD_ID = Regex(""".*\bad\b.*""")
         private const val SWIPE_DELAY_MS = 3000L
-        private const val AD_WAIT_MS = 1200L
+        // 命中后到出手的固定等待。原来是 1.2s（从最早的 v1.3.0 带过来的「等广告动画稳定」），
+        // 现在判定本身就要求广告层连续挂够 700ms/1500ms，这层等待改成只做手势派发余量。
+        private const val AD_WAIT_MS = 300L
         private const val MAX_CONSECUTIVE_SWIPES = 3
         private const val RESET_TIMEOUT_MS = 10000L
         // 红果广告层底部「上滑继续看短剧」提示条的位置（1080×2340 基准）与匹配阈值
@@ -1476,7 +1478,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
         dispatchGesture(gesture, object : GestureResultCallback() {
             override fun onCompleted(gd: GestureDescription?) {
                 Log.d(TAG, "滑动完成")
-                // 广告吞手势跳深链时系统事件可能延迟，主动补两次前台检查
+                // 300ms 快拖下深链可能在手势结束前就弹出来，先当场查一次，再补两次
+                maybeBlockAdDeepLink(activeWindowPackage())
                 handler.postDelayed({ maybeBlockAdDeepLink(activeWindowPackage()) }, 800)
                 handler.postDelayed({ maybeBlockAdDeepLink(activeWindowPackage()) }, 2200)
             }
