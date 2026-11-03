@@ -11,8 +11,8 @@ android {
         applicationId = "com.example.hongguo_adskipper"
         minSdk = 24
         targetSdk = 34
-        versionCode = 48
-        versionName = "2.7.0"
+        versionCode = 49
+        versionName = "2.7.1"
         // 界面只有中文，裁掉 Material/AndroidX 自带的其它语言资源
         resourceConfigurations += listOf("zh", "en")
     }

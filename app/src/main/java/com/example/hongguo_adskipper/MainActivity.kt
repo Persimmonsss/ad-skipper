@@ -5,6 +5,8 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
@@ -25,6 +27,7 @@ import androidx.core.content.FileProvider
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.materialswitch.MaterialSwitch
 import java.io.File
+import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -158,6 +161,10 @@ class MainActivity : AppCompatActivity() {
             playClick()
             openPackage("com.phoenix.read", "未安装红果短剧")
         }
+        findViewById<MaterialButton>(R.id.btn_share_app).setOnClickListener {
+            playClick()
+            shareApp()
+        }
 
         requestNotificationPermission()
     }
@@ -273,6 +280,8 @@ class MainActivity : AppCompatActivity() {
         const val BIT_NLS = 2
         const val BIT_OVERLAY = 4
         const val BIT_BATTERY = 8
+        const val SHARE_URL =
+            "https://u919sgcqrw.doubao.link/app/app_17f6zc6cnj6/ad-skipper"
     }
 
     /**
@@ -373,6 +382,69 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) {
             toast("导出失败：${e.message}")
         }
+    }
+
+    /** 分享弹窗：二维码给对方面扫，或直接发送链接 / 二维码图片。 */
+    private fun shareApp() {
+        val view = layoutInflater.inflate(R.layout.dialog_share, null)
+        val dialog = AlertDialog.Builder(this)
+            .setView(view)
+            .create()
+        view.findViewById<MaterialButton>(R.id.btn_send_link).setOnClickListener {
+            playClick()
+            dialog.dismiss()
+            sendShareText()
+        }
+        view.findViewById<MaterialButton>(R.id.btn_send_qr).setOnClickListener {
+            playClick()
+            dialog.dismiss()
+            sendShareQr()
+        }
+        dialog.show()
+    }
+
+    /** 发送下载页链接，微信/QQ 里点开即可下载。 */
+    private fun sendShareText() {
+        val ver = appVersionName()
+        val text = "跳跳狐 v$ver，免 root 自动跳过开屏 / 红果剧间 / B站内嵌广告。\n" +
+            "下载安装：$SHARE_URL\n" +
+            "装上后先开「无障碍服务 + 电池白名单」；B站 还要开通知使用权。"
+        try {
+            val send = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_SUBJECT, "跳跳狐 v$ver")
+                putExtra(Intent.EXTRA_TEXT, text)
+            }
+            startActivity(Intent.createChooser(send, "分享给朋友"))
+        } catch (e: Exception) {
+            toast("分享失败：${e.message}")
+        }
+    }
+
+    /** 把内置二维码写成 PNG 发出去：对方保存图片后用微信「扫一扫 → 相册」识别。 */
+    private fun sendShareQr() {
+        try {
+            val bmp = BitmapFactory.decodeResource(resources, R.drawable.share_qr)
+                ?: throw IllegalStateException("二维码图片缺失")
+            val file = File(cacheDir, "tiaotiaohu-qr.png")
+            FileOutputStream(file).use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+            val send = Intent(Intent.ACTION_SEND).apply {
+                type = "image/png"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                putExtra(Intent.EXTRA_TEXT, "跳跳狐下载页：$SHARE_URL")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(send, "发送二维码"))
+        } catch (e: Exception) {
+            toast("发送失败：${e.message}")
+        }
+    }
+
+    private fun appVersionName(): String = try {
+        packageManager.getPackageInfo(packageName, 0).versionName ?: ""
+    } catch (e: Exception) {
+        ""
     }
 
     private fun buildDiagReport(): String {
