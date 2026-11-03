@@ -11,13 +11,16 @@ android {
         applicationId = "com.example.hongguo_adskipper"
         minSdk = 24
         targetSdk = 34
-        versionCode = 44
-        versionName = "2.6.3"
+        versionCode = 47
+        versionName = "2.6.6"
+        // 界面只有中文，裁掉 Material/AndroidX 自带的其它语言资源
+        resourceConfigurations += listOf("zh", "en")
     }
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

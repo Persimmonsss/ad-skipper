@@ -24,6 +24,7 @@ import android.view.Display
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import java.util.Random
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
@@ -83,9 +84,6 @@ class AdSkipAccessibilityService : AccessibilityService() {
         private val RE_CLOCK3 = Regex("""\d{1,2}:\d{2}:\d{2}""")
         private val RE_AD_ID = Regex(""".*\bad\b.*""")
         private const val SWIPE_DELAY_MS = 3000L
-        // 命中后到出手的固定等待。原来是 1.2s（从最早的 v1.3.0 带过来的「等广告动画稳定」），
-        // 现在判定本身就要求广告层连续挂够 700ms/1500ms，这层等待改成只做手势派发余量。
-        private const val AD_WAIT_MS = 300L
         private const val MAX_CONSECUTIVE_SWIPES = 3
         private const val RESET_TIMEOUT_MS = 10000L
         // 红果广告层底部「上滑继续看短剧」提示条的位置（1080×2340 基准）与匹配阈值
@@ -233,22 +231,28 @@ class AdSkipAccessibilityService : AccessibilityService() {
         private var zoneLogAt = 0L
         private var zoneLastSign = -1
 
-        // 结构判据采样间隔：红果广告动画能推到 150ms 一个事件，不节流就是每秒四五次全树遍历，
+        // 识别速度三档：只动采样节奏和确认窗口，判据本身不变。
+        // 快档贴近安全下限（切集瞬态实测约 1 秒），稳档拉长窗口换省电。
+        // 采样间隔：红果广告动画能推到 150ms 一个事件，不节流就是每秒四五次全树遍历，
         // 主线程被压死后「已执行滑动」会拖到十几秒后才跑（实测广告出现到划走隔了 36 秒）。
-        private const val STRUCT_SAMPLE_MS = 220L
+        private val structSampleMs: Long
+            get() = when (Settings.speedTier) { 2 -> 180L; 0 -> 350L; else -> 220L }
         // 单次遍历的节点上限，挡住异常深的树
         private const val ZONE_NODE_CAP = 900
         // 广告签名要连续挂够这么久才算广告：切集动画的瞬态只活 ~1 秒，广告一挂几十秒
-        private const val STRUCT_HOLD_MS = 1500L
+        private val structHoldMs: Long
+            get() = when (Settings.speedTier) { 2 -> 1400L; 0 -> 2500L; else -> 1500L }
         // 竖屏广告自带「上滑继续观看短剧」文案，是广告层自己的话，不用等那么久
-        private const val HINT_HOLD_MS = 700L
+        private val hintHoldMs: Long
+            get() = when (Settings.speedTier) { 2 -> 600L; 0 -> 1200L; else -> 700L }
         // 倒计时型提示条（「3s后可继续上滑观看短剧」）在倒计时结束前滑动会被广告层吃掉，
         // 读到 x 秒就把出手时刻钉在 x 秒后（+300ms 余量），最多认 20 秒，防误读把等待拉太长
         private const val COUNTDOWN_CAP_SEC = 20
         private const val COUNTDOWN_MARGIN_MS = 300L
         // 空树广告（canvas/Lynx 渲染，整棵树一个字都不进）没有文案可依，只能比「可见节点数」：
         // 正片基线每台设备自己学，落到 55% 以下且持续 4 秒才算 —— 切集黑屏只活一两秒，挡在外面。
-        private const val CANVAS_HOLD_MS = 4000L
+        private val canvasHoldMs: Long
+            get() = when (Settings.speedTier) { 2 -> 3200L; 0 -> 5500L; else -> 4000L }
         private const val CANVAS_RATIO = 0.55f
         private const val PLAYER_BASE_MIN = 60f
         private const val PLAYER_WINDOW_MS = 30_000L
@@ -256,6 +260,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
         private const val STRUCT_NUDGE_MAX = 12
 
         private val handler = Handler(Looper.getMainLooper())
+        // 手势随机化只在本进程内用，不需要可复现序列
+        private val gestureRandom = Random()
     }
 
     private val biliBubble by lazy { SkipBubble(this) }
@@ -791,18 +797,22 @@ class AdSkipAccessibilityService : AccessibilityService() {
         return root ?: rootInActiveWindow
     }
 
-    // ==================== 省电/速度档位 ====================
-    // 用户在主界面用进度条在「跳广告速度 ↔ 省电」之间选择（Settings.perfLevel 0~100）。
-    // 档位只影响「无广告迹象时的轮询兜底频率」；红果判定改走无障碍树后，
-    // 关键路径固定在事件到达后的 220ms 采样拍上，不再随档位变慢。
+    // ==================== 识别速度三档 ====================
+    // 0=稳（省电）、1=平衡、2=快。采样节奏和确认窗口随档位变，判据不变。
 
-    /** 目标 App 前台轮询兜底间隔：速度端 0.9s，省电端 1.8s。 */
-    private fun checkIntervalActive(): Long =
-        (1800 - Settings.perfLevel * 10).coerceIn(900, 1800).toLong()
+    /** 目标 App 前台轮询兜底间隔：快 0.9s / 平衡 1.2s / 稳 1.8s。 */
+    private fun checkIntervalActive(): Long = when (Settings.speedTier) {
+        2 -> 900L
+        0 -> 1800L
+        else -> 1200L
+    }
 
-    /** 非目标 App 前台轮询间隔（只刷新前台包名，不读界面）：速度端 5s，省电端 10s。 */
-    private fun checkIntervalIdle(): Long =
-        (10000 - Settings.perfLevel * 50).coerceIn(5000, 10000).toLong()
+    /** 非目标 App 前台轮询间隔（只刷新前台包名，不读界面）：快 5s / 平衡 7.5s / 稳 10s。 */
+    private fun checkIntervalIdle(): Long = when (Settings.speedTier) {
+        2 -> 5000L
+        0 -> 10000L
+        else -> 7500L
+    }
 
     // ==================== 核心处理：采集 + 检测广告 ====================
 
@@ -814,7 +824,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
         if (structNudges >= STRUCT_NUDGE_MAX) return
         structNudges++
         handler.removeCallbacks(structNudge)
-        handler.postDelayed(structNudge, STRUCT_SAMPLE_MS)
+        handler.postDelayed(structNudge, structSampleMs)
     }
 
     private fun stopStructNudge() {
@@ -828,11 +838,11 @@ class AdSkipAccessibilityService : AccessibilityService() {
         val hongguo = pkg in HONGGUO_PACKAGES
 
         // 一次全树遍历同时给出分区签名和屏上文案（文案随节点快照回来，不再单独走一棵树）。
-        // 广告动画期事件能密到 150ms 一条，按 STRUCT_SAMPLE_MS 采：两拍确认 ~0.5 秒，
+        // 广告动画期事件能密到 150ms 一条，按档位采样节奏走：两拍确认约 0.4~0.7 秒，
         // 又能把主线程留给手势派发 —— 之前每秒四五次全树遍历，划动手势被拖到 30 秒后才跑。
         val beat = SystemClock.elapsedRealtime()
         var sig: ZoneSig? = null
-        if (beat - structSampleAt >= STRUCT_SAMPLE_MS) {
+        if (beat - structSampleAt >= structSampleMs) {
             structSampleAt = beat
             sig = zoneSignature(rootNode)
             if (sig != null) {
@@ -891,7 +901,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
                 if (structAdSince == 0L) structAdSince = beat
                 structStreak++
                 val held = beat - structAdSince
-                val need = if (byText) HINT_HOLD_MS else STRUCT_HOLD_MS
+                val need = if (byText) hintHoldMs else structHoldMs
                 // 倒计时型：「3s后可继续上滑观看短剧」在秒数没走完前滑动会被广告层吃掉
                 //（11-03 15:11 实测首划白费，2.9 秒后才靠重试划走）。读到 x 秒就钉住出手时刻。
                 if (byText && sig.hintCountdown > 0 && countdownAdSince == 0L) {
@@ -940,7 +950,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
                     // 广告挂多久都要能撑住：把「玩家窗口」一直续到最后一拍，
                     // 否则长广告过了 30 秒窗口就自己失效了
                     lastPlayerFrameAt = beat
-                    if (beat - canvasAdSince >= CANVAS_HOLD_MS) {
+                    if (beat - canvasAdSince >= canvasHoldMs) {
                         canvasAdSince = 0L
                         onAdDetected("空树广告层", currentTime)
                         return
@@ -999,12 +1009,19 @@ class AdSkipAccessibilityService : AccessibilityService() {
             } else {
                 logDebug("滑动未执行：红果已不在前台")
             }
-        }, AD_WAIT_MS)
+        }, adWaitMs())
+    }
+
+    /** 出手前的人类反应延时：快档 150~300ms，平衡 200~400ms，稳档 300~550ms。 */
+    private fun adWaitMs(): Long = when (Settings.speedTier) {
+        2 -> 150L + gestureRandom.nextInt(151)
+        0 -> 300L + gestureRandom.nextInt(251)
+        else -> 200L + gestureRandom.nextInt(201)
     }
 
     /** 跳过成功后显示撤回气泡（可关）：跳错了点「撤回」反向下滑回到上一状态。 */
     private fun showUndoBubble(swipeNo: Long) {
-        if (!Settings.bubbleEnabled) return
+        if (!Settings.undoBubbleEnabled) return
         undoUuid = swipeNo
         undoUntil = SystemClock.elapsedRealtime() + UNDO_BUBBLE_MS
         undoBubble.show("已跳过广告", "撤回") { undoLastSwipe(swipeNo) }
@@ -1029,18 +1046,12 @@ class AdSkipAccessibilityService : AccessibilityService() {
         if (!screenOn()) return
         if (!TARGET_PACKAGES.contains(activeWindowPackage())) return
         val bounds = currentScreenBounds()
-        val path = Path().apply {
-            moveTo(bounds.width() / 2f, bounds.height() * 0.3f)
-            lineTo(bounds.width() / 2f, bounds.height() * 0.7f)
-        }
-        val gesture = GestureDescription.Builder()
-            .addStroke(GestureDescription.StrokeDescription(path, 0, 300L))
-            .build()
+        val (gesture, desc) = buildSwipeGesture(bounds, upward = false)
         dispatchGesture(gesture, object : GestureResultCallback() {
             override fun onCompleted(gd: GestureDescription?) { Log.d(TAG, "撤回滑动完成") }
             override fun onCancelled(gd: GestureDescription?) { Log.w(TAG, "撤回滑动取消") }
         }, null)
-        logDebug("已执行撤回滑动")
+        logDebug("已执行撤回滑动 $desc")
     }
 
     // ==================== 红果剧间广告：提示条模板匹配 ====================
@@ -1557,26 +1568,44 @@ class AdSkipAccessibilityService : AccessibilityService() {
 
     // ==================== 滑动 ====================
 
+    /**
+     * 真手模拟：起点/终点带小偏差、轨迹略弯、时长随机 240~380ms。
+     * 横向只留很小分量，避免斜向甩动被广告创意吃成深链。
+     */
+    private fun buildSwipeGesture(bounds: Rect, upward: Boolean): Pair<GestureDescription, String> {
+        val w = bounds.width().toFloat()
+        val h = bounds.height().toFloat()
+        fun drift(span: Float) = (gestureRandom.nextFloat() - 0.5f) * span
+        val startX = w * (0.5f + drift(0.04f))
+        val endX = startX + w * drift(0.02f)
+        val startY = if (upward) h * (0.66f + drift(0.04f)) else h * (0.30f + drift(0.04f))
+        val endY = if (upward) h * (0.36f + drift(0.04f)) else h * (0.70f + drift(0.04f))
+        val midX = (startX + endX) / 2f + w * drift(0.015f)
+        val midY = (startY + endY) / 2f
+        val duration = 240L + gestureRandom.nextInt(141)
+        val path = Path().apply {
+            moveTo(startX, startY)
+            lineTo(midX, midY)
+            lineTo(endX, endY)
+        }
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0, duration))
+            .build()
+        val desc = "x=${startX.toInt()}->${endX.toInt()} y=${startY.toInt()}->${endY.toInt()} 用时${duration}ms"
+        return gesture to desc
+    }
+
     /** 手势是全局的，落点取决于执行那一刻的前台 App，所以出手前必须再核对一次。 */
     private fun performSwipeUp(): Boolean {
         if (!screenOn()) return false
         if (!TARGET_PACKAGES.contains(activeWindowPackage())) return false
         val bounds = currentScreenBounds()
-        // 快拖：300ms 走完 0.30 屏高。用户实测偏好快拖；代价是广告创意更容易把快速上滑
-        // 认成打开落地页（v2.4.0 的 300ms 甩动曾把用户带进支付宝），所以深链守护是必需项。
-        val sx = bounds.width() / 2f
-        Log.d(TAG, "滑动坐标 x=${sx.toInt()} y=${(bounds.height() * 0.66f).toInt()}->${(bounds.height() * 0.36f).toInt()} 屏幕 ${bounds.width()}x${bounds.height()}")
-        val path = Path().apply {
-            moveTo(sx, bounds.height() * 0.66f)
-            lineTo(sx, bounds.height() * 0.36f)
-        }
+        val (gesture, desc) = buildSwipeGesture(bounds, upward = true)
+        Log.d(TAG, "滑动手势 $desc 屏幕 ${bounds.width()}x${bounds.height()}")
         // 滑动可能被广告创意吃成深链：开 5 秒守护，跳到别的 App 立刻 BACK 回来
         splashGuardPkg = ""
         deepLinkGuardUntil = SystemClock.elapsedRealtime() + 5000
         deepLinkBacks = 0
-        val gesture = GestureDescription.Builder()
-            .addStroke(GestureDescription.StrokeDescription(path, 0, 300L))
-            .build()
         dispatchGesture(gesture, object : GestureResultCallback() {
             override fun onCompleted(gd: GestureDescription?) {
                 Log.d(TAG, "滑动完成")

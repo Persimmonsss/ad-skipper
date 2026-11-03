@@ -16,7 +16,6 @@ import android.provider.Settings as AndroidSettings
 import android.view.SoundEffectConstants
 import android.view.View
 import android.widget.Button
-import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
@@ -36,6 +35,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var dotBattery: View
     private lateinit var swBili: MaterialSwitch
     private lateinit var swBubble: MaterialSwitch
+    private lateinit var swUndoBubble: MaterialSwitch
     private lateinit var swSplash: MaterialSwitch
     private lateinit var swHongguo: MaterialSwitch
     private lateinit var tvBiliState: TextView
@@ -46,6 +46,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnNls: MaterialButton
     private lateinit var btnOverlay: MaterialButton
     private lateinit var btnBattery: MaterialButton
+    private lateinit var btnSpeedSteady: MaterialButton
+    private lateinit var btnSpeedBalanced: MaterialButton
+    private lateinit var btnSpeedFast: MaterialButton
     private var audio: AudioManager? = null
 
     private val handler = Handler(Looper.getMainLooper())
@@ -70,6 +73,7 @@ class MainActivity : AppCompatActivity() {
         dotBattery = findViewById(R.id.dot_battery)
         swBili = findViewById(R.id.sw_bili)
         swBubble = findViewById(R.id.sw_bubble)
+        swUndoBubble = findViewById(R.id.sw_undo_bubble)
         swSplash = findViewById(R.id.sw_splash)
         swHongguo = findViewById(R.id.sw_hongguo)
         tvBiliState = findViewById(R.id.tv_bili_state)
@@ -85,6 +89,7 @@ class MainActivity : AppCompatActivity() {
 
         bindSwitch(swBili) { Settings.biliEnabled = it }
         bindSwitch(swBubble) { Settings.bubbleEnabled = it }
+        bindSwitch(swUndoBubble) { Settings.undoBubbleEnabled = it }
         bindSwitch(swSplash) { Settings.splashEnabled = it }
         bindSwitch(swHongguo) { Settings.hongguoEnabled = it }
 
@@ -106,21 +111,13 @@ class MainActivity : AppCompatActivity() {
             playClick()
             requestIgnoreBattery()
         }
-        findViewById<SeekBar>(R.id.sb_perf).apply {
-            progress = Settings.perfLevel
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                    if (fromUser) {
-                        Settings.perfLevel = p
-                        updatePerfHint(p)
-                    }
-                }
-
-                override fun onStartTrackingTouch(sb: SeekBar?) {}
-                override fun onStopTrackingTouch(sb: SeekBar?) {}
-            })
-        }
-        updatePerfHint(Settings.perfLevel)
+        btnSpeedSteady = findViewById(R.id.btn_speed_steady)
+        btnSpeedBalanced = findViewById(R.id.btn_speed_balanced)
+        btnSpeedFast = findViewById(R.id.btn_speed_fast)
+        btnSpeedSteady.setOnClickListener { playClick(); setSpeedTier(0) }
+        btnSpeedBalanced.setOnClickListener { playClick(); setSpeedTier(1) }
+        btnSpeedFast.setOnClickListener { playClick(); setSpeedTier(2) }
+        renderSpeedTier()
         findViewById<Button>(R.id.btn_clear_log).setOnClickListener {
             playClick()
             Stats.clearLogs()
@@ -153,6 +150,7 @@ class MainActivity : AppCompatActivity() {
         s.isChecked = when (s.id) {
             R.id.sw_bili -> Settings.biliEnabled
             R.id.sw_bubble -> Settings.bubbleEnabled
+            R.id.sw_undo_bubble -> Settings.undoBubbleEnabled
             R.id.sw_splash -> Settings.splashEnabled
             else -> Settings.hongguoEnabled
         }
@@ -172,9 +170,9 @@ class MainActivity : AppCompatActivity() {
         val nls = isNlsEnabled()
         val overlay = AndroidSettings.canDrawOverlays(this)
 
-        tvA11y.text = if (a11y) "无障碍服务：已开启" else "无障碍服务：未开启（开屏/红果/抖音需要）"
-        tvNls.text = if (nls) "通知使用权：已开启" else "通知使用权：未开启（B站跳过需要）"
-        tvOverlay.text = if (overlay) "悬浮窗：已开启" else "悬浮窗：未开启（气泡提示需要）"
+        tvA11y.text = if (a11y) "无障碍服务：已开启" else "无障碍服务：未开启（必需，红果/开屏全靠它）"
+        tvNls.text = if (nls) "通知使用权：已开启" else "通知使用权：未开启（仅 B站 跳过需要）"
+        tvOverlay.text = if (overlay) "悬浮窗：已开启" else "悬浮窗：未开启（仅气泡提醒需要）"
         val battery = isIgnoringBattery()
         tvBattery.text = if (battery) "电池优化：已加白名单（后台不会被冻结）"
             else "电池优化：未加白名单（MIUI 会冻结后台，服务可能自己掉线）"
@@ -192,6 +190,7 @@ class MainActivity : AppCompatActivity() {
 
         swBili.isChecked = Settings.biliEnabled
         swBubble.isChecked = Settings.bubbleEnabled
+        swUndoBubble.isChecked = Settings.undoBubbleEnabled
         swSplash.isChecked = Settings.splashEnabled
         swHongguo.isChecked = Settings.hongguoEnabled
 
@@ -235,24 +234,22 @@ class MainActivity : AppCompatActivity() {
         tvLog.text = if (logs.isEmpty()) "等待事件…" else logs.joinToString("\n")
     }
 
-    /** 省电/速度档位说明：随进度条实时更新。红果改走无障碍树之后，档位只影响
-     *  「无广告迹象时的兜底轮询间隔」，广告本身靠界面事件即时判定（220ms 一拍，两拍确认）。 */
-    private fun updatePerfHint(p: Int) {
-        val pollMs = (1800 - p * 10).coerceIn(900, 1800)
-        val mode = when {
-            p <= 20 -> "很省电"
-            p <= 45 -> "偏省电"
-            p <= 70 -> "平衡"
-            p <= 90 -> "偏快"
-            else -> "最快"
-        }
-        tvPerfHint.text = "$mode：无广告时 ${formatSeconds(pollMs / 1000f)} 兜底扫一次；" +
-            "红果广告出现后约 1~2 秒划走"
+    /** 识别速度三档：只影响采样节奏和确认窗口，广告判据不变。 */
+    private fun setSpeedTier(tier: Int) {
+        Settings.speedTier = tier
+        renderSpeedTier()
     }
 
-    private fun formatSeconds(s: Float): String {
-        val tenths = Math.round(s * 10)
-        return if (tenths % 10 == 0) "${tenths / 10} 秒" else "%.1f 秒".format(tenths / 10f)
+    private fun renderSpeedTier() {
+        val tier = Settings.speedTier
+        btnSpeedSteady.alpha = if (tier == 0) 1f else 0.45f
+        btnSpeedBalanced.alpha = if (tier == 1) 1f else 0.45f
+        btnSpeedFast.alpha = if (tier == 2) 1f else 0.45f
+        tvPerfHint.text = when (tier) {
+            2 -> "快：约 0.9 秒兜底扫一次，确认窗口最短，广告出现后最快出手"
+            0 -> "稳：约 1.8 秒兜底扫一次，确认窗口最长，最省电"
+            else -> "平衡：约 1.2 秒兜底扫一次，广告出现后约 1~2 秒划走"
+        }
     }
 
     /** 状态点：绿=已开启，橙=未开启。 */

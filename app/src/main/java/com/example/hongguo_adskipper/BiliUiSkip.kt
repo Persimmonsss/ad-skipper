@@ -343,8 +343,9 @@ class BiliUiSkip(
         offerUndo(seg)
     }
 
-    /** 跳过生效后 3 秒内可点气泡撤回，回到广告前 2 秒。 */
+    /** 跳过生效后 3 秒内可点气泡撤回，回到广告前 2 秒；撤回气泡关掉时不占扫描空窗。 */
     private fun offerUndo(seg: AdSegment) {
+        if (!Settings.undoBubbleEnabled) return
         val now = SystemClock.elapsedRealtime()
         undoUntil = now + UNDO_MS
         undoTo = (seg.startMs - UNDO_BACK_MS).coerceAtLeast(0)
