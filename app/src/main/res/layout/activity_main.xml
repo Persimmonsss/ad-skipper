@@ -55,6 +55,38 @@
             </LinearLayout>
         </LinearLayout>
 
+        <!-- 权限掉线提醒 -->
+        <LinearLayout
+            android:id="@+id/banner_perm"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:background="@drawable/warn_bg"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:padding="14dp"
+            android:visibility="gone">
+
+            <TextView
+                android:id="@+id/tv_perm_warning"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:lineSpacingExtra="2dp"
+                android:textColor="@color/primary_variant"
+                android:textSize="12sp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btn_perm_fix"
+                style="@style/Widget.Material3.Button.TonalButton"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:layout_marginStart="8dp"
+                android:minWidth="0dp"
+                android:text="去修复"
+                android:textSize="12sp" />
+        </LinearLayout>
+
         <!-- 权限 -->
         <LinearLayout
             android:layout_width="match_parent"
@@ -241,6 +273,22 @@
                 android:textStyle="bold" />
 
             <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/sw_pause"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:text="暂停全部跳过"
+                android:textColor="@color/text_primary"
+                android:textSize="14sp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="暂停后不检测也不滑动；通知栏也能一键开关"
+                android:textColor="@color/text_hint"
+                android:textSize="11sp" />
+
+            <com.google.android.material.materialswitch.MaterialSwitch
                 android:id="@+id/sw_bili"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -400,6 +448,16 @@
                 android:textStyle="bold" />
 
             <TextView
+                android:id="@+id/tv_today"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="今天还没跳过广告"
+                android:textColor="@color/text_primary"
+                android:textSize="14sp"
+                android:textStyle="bold" />
+
+            <TextView
                 android:id="@+id/tv_bili_state"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -452,6 +510,15 @@
                     android:textColor="@color/text_primary"
                     android:textSize="15sp"
                     android:textStyle="bold" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btn_export_log"
+                    style="@style/Widget.Material3.Button.TextButton"
+                    android:layout_width="wrap_content"
+                    android:layout_height="36dp"
+                    android:minWidth="0dp"
+                    android:text="导出"
+                    android:textSize="12sp" />
 
                 <com.google.android.material.button.MaterialButton
                     android:id="@+id/btn_clear_log"

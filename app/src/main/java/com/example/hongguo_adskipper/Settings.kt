@@ -37,6 +37,16 @@ object Settings {
         get() = sp().getBoolean("hongguo_enabled", true)
         set(v) { putBool("hongguo_enabled", v) }
 
+    /** 全局暂停：暂停时不检测、不点击、不滑动，恢复后照常。 */
+    var paused: Boolean
+        get() = sp().getBoolean("paused", false)
+        set(v) { putBool("paused", v) }
+
+    /** 上次看到的权限位（1 无障碍 / 2 通知使用权 / 4 悬浮窗 / 8 电池白名单），用来识别掉线。 */
+    var lastPermBits: Int
+        get() = sp().getInt("last_perm_bits", 0)
+        set(v) { sp().edit().putInt("last_perm_bits", v).apply() }
+
     /** 识别速度档：0=稳（省电），1=平衡（默认），2=快。旧版 0~100 进度条首次读到时自动折算。 */
     var speedTier: Int
         get() {

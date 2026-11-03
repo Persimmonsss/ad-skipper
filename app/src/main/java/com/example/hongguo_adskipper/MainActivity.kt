@@ -18,10 +18,16 @@ import android.view.View
 import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.materialswitch.MaterialSwitch
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class MainActivity : AppCompatActivity() {
 
@@ -38,10 +44,16 @@ class MainActivity : AppCompatActivity() {
     private lateinit var swUndoBubble: MaterialSwitch
     private lateinit var swSplash: MaterialSwitch
     private lateinit var swHongguo: MaterialSwitch
+    private lateinit var swPause: MaterialSwitch
     private lateinit var tvBiliState: TextView
     private lateinit var tvStats: TextView
+    private lateinit var tvToday: TextView
     private lateinit var tvLog: TextView
     private lateinit var tvPerfHint: TextView
+    private lateinit var bannerPerm: View
+    private lateinit var tvPermWarning: TextView
+    private var droppedBits = 0
+    private var dropDialogShown = false
     private lateinit var btnA11y: MaterialButton
     private lateinit var btnNls: MaterialButton
     private lateinit var btnOverlay: MaterialButton
@@ -76,10 +88,14 @@ class MainActivity : AppCompatActivity() {
         swUndoBubble = findViewById(R.id.sw_undo_bubble)
         swSplash = findViewById(R.id.sw_splash)
         swHongguo = findViewById(R.id.sw_hongguo)
+        swPause = findViewById(R.id.sw_pause)
         tvBiliState = findViewById(R.id.tv_bili_state)
         tvStats = findViewById(R.id.tv_stats)
+        tvToday = findViewById(R.id.tv_today)
         tvLog = findViewById(R.id.tv_log)
         tvPerfHint = findViewById(R.id.tv_perf_hint)
+        bannerPerm = findViewById(R.id.banner_perm)
+        tvPermWarning = findViewById(R.id.tv_perm_warning)
         btnA11y = findViewById(R.id.btn_a11y)
         btnNls = findViewById(R.id.btn_nls)
         btnOverlay = findViewById(R.id.btn_overlay)
@@ -92,6 +108,18 @@ class MainActivity : AppCompatActivity() {
         bindSwitch(swUndoBubble) { Settings.undoBubbleEnabled = it }
         bindSwitch(swSplash) { Settings.splashEnabled = it }
         bindSwitch(swHongguo) { Settings.hongguoEnabled = it }
+        bindSwitch(swPause) {
+            Settings.paused = it
+            AdSkipAccessibilityService.instance?.refreshNotification()
+        }
+        findViewById<MaterialButton>(R.id.btn_perm_fix).setOnClickListener {
+            playClick()
+            openFirstMissingPermission()
+        }
+        findViewById<MaterialButton>(R.id.btn_export_log).setOnClickListener {
+            playClick()
+            exportDiagnostics()
+        }
 
         findViewById<MaterialButton>(R.id.btn_a11y).setOnClickListener {
             playClick()
@@ -152,6 +180,7 @@ class MainActivity : AppCompatActivity() {
             R.id.sw_bubble -> Settings.bubbleEnabled
             R.id.sw_undo_bubble -> Settings.undoBubbleEnabled
             R.id.sw_splash -> Settings.splashEnabled
+            R.id.sw_pause -> Settings.paused
             else -> Settings.hongguoEnabled
         }
         s.setOnCheckedChangeListener { _, checked ->
@@ -181,6 +210,7 @@ class MainActivity : AppCompatActivity() {
         setDot(dotNls, nls)
         setDot(dotOverlay, overlay)
         setDot(dotBattery, battery)
+        checkPermissionAlerts(a11y, nls, overlay, battery)
 
         // 权限按钮状态同步：已开启的显示「已开启」并置灰，未开启的保持「去开启/去设置」可点
         syncPermButton(btnA11y, a11y, "去开启")
@@ -193,6 +223,7 @@ class MainActivity : AppCompatActivity() {
         swUndoBubble.isChecked = Settings.undoBubbleEnabled
         swSplash.isChecked = Settings.splashEnabled
         swHongguo.isChecked = Settings.hongguoEnabled
+        swPause.isChecked = Settings.paused
 
         val title = Stats.biliTitle
         val bvid = Stats.biliBvid
@@ -211,6 +242,8 @@ class MainActivity : AppCompatActivity() {
                 if (dur > 0) append(" / ").append(fmt(dur))
             }
         }
+        tvToday.text = if (Today.count == 0) "今天还没跳过广告"
+            else "今天跳过 ${Today.count} 次 · 约省 ${Today.savedText()}"
         // 三个模块统一口径：检测（认出广告）/ 跳过（下发动作）/ 成功（复核生效），累计不清零
         tvStats.text = buildString {
             append("B站 检测 ").append(Counters.of(SkipStat.BILI_DETECT))
@@ -232,6 +265,159 @@ class MainActivity : AppCompatActivity() {
 
         val logs = Stats.logLines()
         tvLog.text = if (logs.isEmpty()) "等待事件…" else logs.joinToString("\n")
+    }
+
+    /** 权限位：1 无障碍 / 2 通知使用权 / 4 悬浮窗 / 8 电池白名单。 */
+    private companion object {
+        const val BIT_A11Y = 1
+        const val BIT_NLS = 2
+        const val BIT_OVERLAY = 4
+        const val BIT_BATTERY = 8
+    }
+
+    /**
+     * 掉线提醒：必需权限缺了常驻横幅；原本开过、后来被系统关掉的按需权限也提示。
+     * 必需权限是「掉线」而不是「首次没开」时再弹一次窗，避免新装用户被连环弹窗打扰。
+     */
+    private fun checkPermissionAlerts(a11y: Boolean, nls: Boolean, overlay: Boolean, battery: Boolean) {
+        val current = (if (a11y) BIT_A11Y else 0) or
+            (if (nls) BIT_NLS else 0) or
+            (if (overlay) BIT_OVERLAY else 0) or
+            (if (battery) BIT_BATTERY else 0)
+        if (Settings.lastPermBits != 0) {
+            droppedBits = droppedBits or (Settings.lastPermBits and current.inv())
+        }
+        Settings.lastPermBits = current
+
+        if (droppedBits and (BIT_A11Y or BIT_BATTERY) != 0 && !dropDialogShown) {
+            dropDialogShown = true
+            val lost = ArrayList<String>(2)
+            if (droppedBits and BIT_A11Y != 0) lost.add("无障碍服务")
+            if (droppedBits and BIT_BATTERY != 0) lost.add("电池优化白名单")
+            AlertDialog.Builder(this)
+                .setTitle("权限掉线了")
+                .setMessage("${lost.joinToString("、")}被系统关掉了。\n\n自动跳过会失效，点「去修复」重新打开。")
+                .setPositiveButton("去修复") { _, _ -> openFirstMissingPermission() }
+                .setNegativeButton("知道了", null)
+                .show()
+        }
+
+        val msgs = ArrayList<String>(4)
+        if (!a11y) msgs.add("无障碍服务未开，跳广告完全用不了")
+        if (!battery) msgs.add("电池白名单未加，后台可能被冻结")
+        if (Settings.biliEnabled && droppedBits and BIT_NLS != 0 && !nls) {
+            msgs.add("通知使用权掉线，B站 跳过暂停")
+        }
+        if ((Settings.undoBubbleEnabled || Settings.bubbleEnabled) &&
+            droppedBits and BIT_OVERLAY != 0 && !overlay
+        ) {
+            msgs.add("悬浮窗掉线，气泡/撤回不可用")
+        }
+        if (msgs.isEmpty()) {
+            bannerPerm.visibility = View.GONE
+        } else {
+            bannerPerm.visibility = View.VISIBLE
+            tvPermWarning.text = "权限提醒：" + msgs.joinToString("；") + "。"
+        }
+    }
+
+    /** 按必需优先、再按需的顺序，打开第一个缺的权限设置页。 */
+    private fun openFirstMissingPermission() {
+        val a11y = isA11yEnabled()
+        val battery = isIgnoringBattery()
+        val nls = isNlsEnabled()
+        val overlay = AndroidSettings.canDrawOverlays(this)
+        when {
+            !a11y -> startActivitySafe(Intent(AndroidSettings.ACTION_ACCESSIBILITY_SETTINGS))
+            !battery -> requestIgnoreBattery()
+            Settings.biliEnabled && !nls ->
+                startActivitySafe(Intent(AndroidSettings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+            (Settings.undoBubbleEnabled || Settings.bubbleEnabled) && !overlay ->
+                startActivitySafe(
+                    Intent(
+                        AndroidSettings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        Uri.parse("package:$packageName")
+                    )
+                )
+            !nls -> startActivitySafe(Intent(AndroidSettings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+            !overlay -> startActivitySafe(
+                Intent(
+                    AndroidSettings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:$packageName")
+                )
+            )
+        }
+    }
+
+    /** 诊断报告：设备/权限/设置/计数 + 最近日志，分享给微信即可。 */
+    private fun exportDiagnostics() {
+        val report = try {
+            buildDiagReport()
+        } catch (e: Exception) {
+            toast("生成诊断报告失败：${e.message}")
+            return
+        }
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.CHINA).format(Date())
+        val file = File(cacheDir, "tiaotiaohu_$stamp.txt")
+        try {
+            DiagLog.flushNow()
+            file.writeText(report)
+            val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+            val send = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                putExtra(Intent.EXTRA_SUBJECT, "跳跳狐诊断日志")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(send, "导出诊断日志"))
+        } catch (e: Exception) {
+            toast("导出失败：${e.message}")
+        }
+    }
+
+    private fun buildDiagReport(): String {
+        val ver = try {
+            packageManager.getPackageInfo(packageName, 0).versionName
+        } catch (e: Exception) {
+            "?"
+        }
+        val now = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.CHINA).format(Date())
+        val logs = DiagLog.fileTail(500).ifEmpty { DiagLog.recentLines() }
+        return buildString {
+            appendLine("跳跳狐 v$ver 诊断日志")
+            appendLine("生成时间：$now")
+            appendLine("设备：${Build.MANUFACTURER} ${Build.MODEL} / Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})")
+            appendLine()
+            appendLine("【权限】")
+            appendLine("无障碍服务：${onOff(isA11yEnabled())}")
+            appendLine("通知使用权：${onOff(isNlsEnabled())}")
+            appendLine("悬浮窗：${onOff(AndroidSettings.canDrawOverlays(this@MainActivity))}")
+            appendLine("电池优化白名单：${onOff(isIgnoringBattery())}")
+            appendLine()
+            appendLine("【设置】")
+            appendLine("B站：${onOff(Settings.biliEnabled)} ｜ 跳过前气泡：${onOff(Settings.bubbleEnabled)}")
+            appendLine("撤回气泡：${onOff(Settings.undoBubbleEnabled)} ｜ 开屏：${onOff(Settings.splashEnabled)}")
+            appendLine("红果/抖音：${onOff(Settings.hongguoEnabled)} ｜ 速度：${speedName()} ｜ 暂停：${onOff(Settings.paused)}")
+            appendLine()
+            appendLine("【今日】跳过 ${Today.count} 次，约省 ${Today.savedText()}")
+            appendLine(
+                "【累计】B站 检测${Counters.of(SkipStat.BILI_DETECT)}/跳过${Counters.of(SkipStat.BILI_SKIP)}/成功${Counters.of(SkipStat.BILI_SUCCESS)}/撤回${Counters.of(SkipStat.BILI_UNDO)}；" +
+                    "开屏 检测${Counters.of(SkipStat.SPLASH_DETECT)}/跳过${Counters.of(SkipStat.SPLASH_SKIP)}/成功${Counters.of(SkipStat.SPLASH_SUCCESS)}；" +
+                    "红果 检测${Counters.of(SkipStat.HG_DETECT)}/跳过${Counters.of(SkipStat.HG_SKIP)}/成功${Counters.of(SkipStat.HG_SUCCESS)}/失败${Counters.of(SkipStat.HG_FAIL)}"
+            )
+            Stats.lastError?.let { appendLine("最近异常：$it") }
+            appendLine()
+            appendLine("【日志】最近 ${logs.size} 行")
+            logs.forEach { appendLine(it) }
+        }
+    }
+
+    private fun onOff(on: Boolean) = if (on) "开" else "关"
+
+    private fun speedName() = when (Settings.speedTier) {
+        0 -> "稳"
+        2 -> "快"
+        else -> "平衡"
     }
 
     /** 识别速度三档：只影响采样节奏和确认窗口，广告判据不变。 */

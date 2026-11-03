@@ -13,6 +13,7 @@ import android.graphics.Color
 import android.graphics.Path
 import android.graphics.Point
 import android.graphics.Rect
+import android.graphics.drawable.Icon
 import android.hardware.display.DisplayManager
 import android.os.Build
 import android.os.Handler
@@ -24,6 +25,7 @@ import android.view.Display
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.widget.RemoteViews
 import java.util.Random
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -182,6 +184,9 @@ class AdSkipAccessibilityService : AccessibilityService() {
         )
 
         // ========== 统计数据 ==========
+        @Volatile var instance: AdSkipAccessibilityService? = null
+            private set
+
         var isServiceEnabled = false
             private set
 
@@ -324,7 +329,10 @@ class AdSkipAccessibilityService : AccessibilityService() {
     /** B站前台时才跑；离开 B站即停，避免常驻 1s 唤醒。 */
     private val biliTicker = object : Runnable {
         override fun run() {
-            if (!screenOn()) return
+            if (!screenOn() || Settings.paused) {
+                biliBubble.hide()
+                return
+            }
             if (foregroundPkg != BiliUiSkip.BILI_PKG) {
                 // 断链前先核对一次活动窗口：前台包名可能被别的窗口事件顶掉，而 B站详情页
                 // 播放期间几乎没有无障碍事件，一断链就要等 periodicCheck 的 30 秒兜底才复活
@@ -349,6 +357,16 @@ class AdSkipAccessibilityService : AccessibilityService() {
     override fun onCreate() {
         super.onCreate()
         Settings.init(this)
+        instance = this
+    }
+
+    /** 通知栏暂停/恢复后立刻刷新常驻通知；暂停时顺手收掉气泡。 */
+    fun refreshNotification() {
+        if (Settings.paused) {
+            biliBubble.hide()
+            undoBubble.hide()
+        }
+        updateNotification()
     }
 
     override fun onServiceConnected() {
@@ -402,28 +420,65 @@ class AdSkipAccessibilityService : AccessibilityService() {
             this, 0, intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
-        val text = "已跳过 B站 ${Counters.of(SkipStat.BILI_SUCCESS)} · " +
-            "开屏 ${Counters.of(SkipStat.SPLASH_SUCCESS)} · " +
-            "红果 ${Counters.of(SkipStat.HG_SUCCESS)}"
+        val paused = Settings.paused
+        val title = if (paused) "$notificationTitle · 已暂停" else notificationTitle
+        val text = if (paused) "已暂停，点「恢复」继续自动跳过"
+            else "今日 ${Today.count} 次 · B站 ${Counters.of(SkipStat.BILI_SUCCESS)}" +
+                " · 开屏 ${Counters.of(SkipStat.SPLASH_SUCCESS)}" +
+                " · 红果 ${Counters.of(SkipStat.HG_SUCCESS)}"
+        // MIUI 自定义主题会吃掉标准 action 按钮，改用 RemoteViews 把按钮画进内容区
+        val actionPi = PendingIntent.getBroadcast(
+            this, 1,
+            Intent(this, NotifActionReceiver::class.java).setAction(NotifActionReceiver.ACTION_TOGGLE_PAUSE),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val custom = RemoteViews(packageName, R.layout.notif_control).apply {
+            setTextViewText(R.id.notif_title, title)
+            setTextViewText(R.id.notif_text, text)
+            setTextViewText(R.id.notif_action, if (paused) "恢复" else "暂停")
+            setOnClickPendingIntent(R.id.notif_action, actionPi)
+            setOnClickPendingIntent(R.id.notif_root, pendingIntent)
+        }
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, CHANNEL_ID)
-                .setContentTitle(notificationTitle)
+                .setContentTitle(title)
                 .setContentText(text)
-                .setStyle(Notification.BigTextStyle().bigText("$text\n短剧: $dramaTitle $currentEpisode\n$debugLog"))
                 .setSmallIcon(android.R.drawable.ic_media_play)
                 .setContentIntent(pendingIntent)
+                .setCustomContentView(custom)
+                .setStyle(Notification.DecoratedCustomViewStyle())
+                .addAction(pauseAction(paused))
+                .setOnlyAlertOnce(true)
                 .setOngoing(true)
                 .build()
         } else {
             @Suppress("DEPRECATION")
             Notification.Builder(this)
-                .setContentTitle(notificationTitle)
+                .setContentTitle(title)
                 .setContentText(text)
                 .setSmallIcon(android.R.drawable.ic_media_play)
                 .setContentIntent(pendingIntent)
+                .setCustomContentView(custom)
+                .setStyle(Notification.DecoratedCustomViewStyle())
+                .addAction(pauseAction(paused))
+                .setOnlyAlertOnce(true)
                 .setOngoing(true)
                 .build()
         }
+    }
+
+    /** 通知栏的一键暂停/恢复：广播回来翻转全局开关，再刷新这条通知。 */
+    private fun pauseAction(paused: Boolean): Notification.Action {
+        val intent = Intent(this, NotifActionReceiver::class.java)
+            .setAction(NotifActionReceiver.ACTION_TOGGLE_PAUSE)
+        val pi = PendingIntent.getBroadcast(
+            this, 1, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val icon = Icon.createWithResource(
+            this, if (paused) android.R.drawable.ic_media_play else android.R.drawable.ic_media_pause
+        )
+        return Notification.Action.Builder(icon, if (paused) "恢复" else "暂停", pi).build()
     }
 
     private fun updateNotification() {
@@ -434,6 +489,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
     private fun logDebug(msg: String) {
         debugLog = msg
         Log.d(TAG, msg)
+        DiagLog.log(msg)
         updateNotification()
     }
 
@@ -463,6 +519,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
                 Log.w(TAG, "深链兜底异常: ${e.message}")
             }
         }
+        // 全局暂停：前台归属和深链守护照常更新，其余检测/手势全部停手
+        if (Settings.paused) return
         if (Settings.splashEnabled) {
             try {
                 handleSplashEvent(event, appSwitched)
@@ -704,7 +762,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
     // ==================== 定时轮询 ====================
 
     private fun performPeriodicCheck() {
-        if (!screenOn()) return
+        if (!screenOn() || Settings.paused) return
         // 前台归属每拍都以活动窗口校正：窗口事件会把前台包名顶到系统浮层上，而
         // 「30 秒兜底刷新」只要还有窗口事件进来就会被无限推迟，永远等不到
         val active = activeWindowPackage()
@@ -1437,6 +1495,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
             // 一条广告只记一次成功，否则成功数会盖过检测数
             successCounted = true
             Counters.inc(SkipStat.HG_SUCCESS)
+            Today.record(15_000L)
             retryingAd = false
             lockRetries = 0
             logDebug("滑动成功，已离开广告（$reason）")
@@ -1597,7 +1656,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
 
     /** 手势是全局的，落点取决于执行那一刻的前台 App，所以出手前必须再核对一次。 */
     private fun performSwipeUp(): Boolean {
-        if (!screenOn()) return false
+        if (!screenOn() || Settings.paused) return false
         if (!TARGET_PACKAGES.contains(activeWindowPackage())) return false
         val bounds = currentScreenBounds()
         val (gesture, desc) = buildSwipeGesture(bounds, upward = true)
@@ -1653,7 +1712,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
     private val splashTicker = object : Runnable {
         override fun run() {
             val now = SystemClock.elapsedRealtime()
-            if (now > splashUntil || !screenOn() || splashPkg == null) return
+            if (now > splashUntil || !screenOn() || Settings.paused || splashPkg == null) return
             try {
                 scanSplashOnce(now)
             } catch (e: Exception) {
@@ -1664,7 +1723,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
     }
 
     private fun handleSplashEvent(event: AccessibilityEvent, appSwitched: Boolean) {
-        if (!Settings.splashEnabled) return
+        if (!Settings.splashEnabled || Settings.paused) return
         val pkg = event.packageName?.toString() ?: return
         if (pkg == packageName) return
         if (SPLASH_SKIP_PKGS.any { pkg == it || pkg.startsWith("$it.") }) return
@@ -1742,6 +1801,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
                 if (!splashSuccessCounted) {
                     splashSuccessCounted = true
                     Counters.inc(SkipStat.SPLASH_SUCCESS)
+                    Today.record(5_000L)
                 }
                 logDebug("开屏已关闭")
             }
@@ -1980,6 +2040,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
     }
 
     private fun clickNode(node: AccessibilityNodeInfo): Boolean {
+        if (Settings.paused) return false
         if (node.isClickable && node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
         // 不可点的文字节点直接按它自己的中心点落指，比点祖先容器稳
         val r = Rect()
@@ -1997,6 +2058,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
     override fun onDestroy() {
         super.onDestroy()
         isServiceEnabled = false
+        if (instance === this) instance = null
         handler.removeCallbacks(periodicCheck)
         handler.removeCallbacks(biliTicker)
         handler.removeCallbacks(structNudge)

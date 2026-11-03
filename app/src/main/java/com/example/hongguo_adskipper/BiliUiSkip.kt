@@ -338,6 +338,7 @@ class BiliUiSkip(
             Stats.biliPositionMs = posMs
         }
         Counters.inc(SkipStat.BILI_SUCCESS)
+        Today.record((seg.endMs - seg.startMs).coerceIn(1000L, 300_000L))
         Stats.biliLastSkip = "${fmt(seg.startMs)} → ${fmt(seg.endMs)}"
         Stats.log("seek 生效（${if (at.first) "界面" else "会话"}），当前 ${fmt(at.second)}")
         offerUndo(seg)

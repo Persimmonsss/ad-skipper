@@ -45,6 +45,22 @@
                 android:resource="@xml/accessibility_service_config" />
         </service>
 
+        <!-- 常驻通知里的暂停/恢复按钮 -->
+        <receiver
+            android:name=".NotifActionReceiver"
+            android:exported="false" />
+
+        <!-- 诊断日志导出：把 cache 里的 txt 通过 FileProvider 分享出去 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
         <!-- 通知使用权：B站播放进度与媒体控制 -->
         <service
             android:name=".BiliPlaybackWatcher"

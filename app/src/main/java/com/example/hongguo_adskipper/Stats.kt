@@ -25,6 +25,7 @@ object Stats {
     fun log(msg: String) {
         val line = "${timeFmt.format(Date())}  $msg"
         Log.i("AdSkipper", msg)
+        DiagLog.log(msg)
         synchronized(logs) {
             logs.addFirst(line)
             while (logs.size > MAX_LOGS) logs.removeLast()
