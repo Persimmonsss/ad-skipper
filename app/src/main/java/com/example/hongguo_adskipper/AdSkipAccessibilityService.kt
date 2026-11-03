@@ -242,6 +242,12 @@ class AdSkipAccessibilityService : AccessibilityService() {
         private const val STRUCT_HOLD_MS = 1500L
         // 竖屏广告自带「上滑继续观看短剧」文案，是广告层自己的话，不用等那么久
         private const val HINT_HOLD_MS = 700L
+        // 空树广告（canvas/Lynx 渲染，整棵树一个字都不进）没有文案可依，只能比「可见节点数」：
+        // 正片基线每台设备自己学，落到 55% 以下且持续 4 秒才算 —— 切集黑屏只活一两秒，挡在外面。
+        private const val CANVAS_HOLD_MS = 4000L
+        private const val CANVAS_RATIO = 0.55f
+        private const val PLAYER_BASE_MIN = 60f
+        private const val PLAYER_WINDOW_MS = 30_000L
         // 追拍上限：12 × 220ms ≈ 2.6 秒，够确认一次，又不会变成常驻轮询
         private const val STRUCT_NUDGE_MAX = 12
 
@@ -264,6 +270,10 @@ class AdSkipAccessibilityService : AccessibilityService() {
     private var structSampleAt = 0L
     // 本轮广告签名第一次出现的时刻（0 = 当前没有签名），用来量「挂了多久」
     private var structAdSince = 0L
+    // 正片可见节点数基线：每台设备自己学，空树广告靠它做差分判定（绝对阈值跨机型必失效）
+    private var playerVisBase = 0f
+    private var lastPlayerFrameAt = 0L
+    private var canvasAdSince = 0L
     // 签名挂上后自己追拍的次数（静态广告不再推 CONTENT_CHANGED，只等事件确认要 2 秒）
     private var structNudges = 0
     private val structNudge = Runnable {
@@ -578,8 +588,11 @@ class AdSkipAccessibilityService : AccessibilityService() {
         if (sign == zoneLastSign && now - zoneLogAt < 4000L) return
         zoneLogAt = now
         zoneLastSign = sign
+        val wins = try { windows.size } catch (e: Exception) { -1 }
         Log.d(TAG, "探针Z 上左=${sig.ul} 上右=${sig.ur} 底中=${sig.bm} 底条=${sig.bb} " +
-            "可见=${sig.vis} 横屏=${sig.landscape} 播放器控件=${sig.playerUi} 判广告=$sign 文案[${sig.texts.take(5).joinToString(" ")}]")
+            "可见=${sig.vis} 横屏=${sig.landscape} 播放器控件=${sig.playerUi} 提示条=${sig.hintText} " +
+            "守卫=${sig.playGuard} 窗口=$wins 判广告=$sign 文案[${sig.texts.take(5).joinToString(" ")}] " +
+            "id[${sig.ids.joinToString(" ")}]")
     }
 
     /**
@@ -600,12 +613,15 @@ class AdSkipAccessibilityService : AccessibilityService() {
         var seen = 0
         var playerUi = false
         var hintText = false
+        var playGuard = false
         val texts = ArrayList<String>(24)
+        val ids = ArrayList<String>(10)
         fun walk(n: AccessibilityNodeInfo, d: Int) {
             if (d > 30 || seen >= ZONE_NODE_CAP) return
             seen++
             if (!n.isVisibleToUser) return
             vis++
+            val vid = n.viewIdResourceName
             val label = n.text?.toString()?.trim()?.ifEmpty { null }
                 ?: n.contentDescription?.toString()?.trim()?.ifEmpty { null }
             if (label != null) {
@@ -613,8 +629,17 @@ class AdSkipAccessibilityService : AccessibilityService() {
                 // 只有真在播放页才会「全屏观看」可见（实测 00:04:47 信息流广告卡片就是靠这条挡掉的）
                 if (label.contains("全屏观看")) playerUi = true
                 // 广告层自己写进树里的提示条：竖屏「上滑继续观看短剧」，横屏同理带这条
-                if (label.contains("上滑继续")) hintText = true
+                if (HINT_TEXT_RE.containsMatchIn(label)) hintText = true
+                // 正片 UI 的反向闸门：命中即整屏不算广告（宁漏勿误）
+                if (!playGuard && PLAY_GUARD_RE.containsMatchIn(label)) playGuard = true
                 if (texts.size < 24) texts.add(label)
+                // 广告层关键节点无条件抄 id（不管多大），这是逆向要的靶子
+                if (vid != null && ids.size < 12 &&
+                    (HINT_TEXT_RE.containsMatchIn(label) || label == "广告" || label.contains("立即领取"))
+                ) {
+                    val entry = (n.className?.toString()?.substringAfterLast('.') ?: "?") + "#" + vid
+                    if (!ids.contains(entry)) ids.add(entry)
+                }
             }
             val b = Rect()
             n.getBoundsInScreen(b)
@@ -632,6 +657,12 @@ class AdSkipAccessibilityService : AccessibilityService() {
                     area <= 0.06f * sw * sh
                 ) bm++
                 if (w >= 0.88f * sw && h <= 0.30f * sh && b.bottom >= 0.94f * sh) bb++
+                // 探针顺路抄 id：viewId 是节点快照里的字段，不额外跨进程。
+                // 只收中小件 —— 全屏容器一抓一大把，会把名额吃光，广告层的小卡片就看不见了。
+                if (vid != null && ids.size < 12 && area >= 0.003f * sw * sh && area <= 0.25f * sw * sh) {
+                    val entry = (n.className?.toString()?.substringAfterLast('.') ?: "?") + "#" + vid
+                    if (!ids.contains(entry)) ids.add(entry)
+                }
             }
             for (i in 0 until n.childCount) {
                 if (seen >= ZONE_NODE_CAP) break
@@ -639,10 +670,10 @@ class AdSkipAccessibilityService : AccessibilityService() {
             }
         }
         walk(rootNode, 0)
-        val sig = ZoneSig(ul, ur, bm, bb, vis, false, sw > sh, playerUi, hintText, texts)
+        val sig = ZoneSig(ul, ur, bm, bb, vis, false, sw > sh, playerUi, hintText, playGuard, ids, texts)
         // 「广告」合规角标只在判据已经成立后才查：findAccessibilityNodeInfosByText 是跨进程查询，
-        // 每个事件都问一遍是主线程被拖死的原因之一。
-        return if (!sig.adScreen) sig else sig.copy(adTag = try {
+        // 每个事件都问一遍是主线程被拖死的原因之一。横屏必须先查它才能定 adLike，所以按 adGeo 提前。
+        return if (!sig.adScreen && !sig.adGeo) sig else sig.copy(adTag = try {
             rootNode.findAccessibilityNodeInfosByText("广告").any { it.isVisibleToUser }
         } catch (e: Exception) {
             false
@@ -802,23 +833,36 @@ class AdSkipAccessibilityService : AccessibilityService() {
             structStreak = 0
             structAdSince = 0L
             stopStructNudge()
+            // 空树广告的计时也不能跨 App 残留：否则切回来第一帧就可能直接判定并划走
+            canvasAdSince = 0L
         } else if (sig != null) {
             // 全屏时用户可能旋转屏幕：方向一变两套判据整体换向，旧方向的计数不能算数
             if (lastLandscape != null && lastLandscape != sig.landscape) {
                 structStreak = 0
                 structAdSince = 0L
+                canvasAdSince = 0L
                 stopStructNudge()
                 logDebug("方向切换 ${if (sig.landscape) "横屏" else "竖屏"}，重新计数")
             }
             lastLandscape = sig.landscape
+            // 正片基线：只认「播放器正片 UI 在屏」的竖屏帧（标题带集号/作者声明），广告帧不参与。
+            // 不用「全屏观看」做条件 —— K40 的播放器控件不进树（实测恒为 false），只靠它永远学不到基线。
+            // 横屏帧也不能学：横屏正片本来就只有 44~66 个节点，混进来会把基线拉低，竖屏空树广告就漏了。
+            if (!sig.landscape && sig.vis >= 40 &&
+                sig.texts.any { EPISODE_RE.containsMatchIn(it) || it.contains("作者声明") }
+            ) {
+                playerVisBase = if (playerVisBase <= 0f) sig.vis.toFloat()
+                    else playerVisBase * 0.8f + sig.vis * 0.2f
+                lastPlayerFrameAt = beat
+            }
         }
         // 倒计时重试循环进行中：红果还在同一广告页，轮询不再重复触发（避免耗尽连续滑动预算）
         if (retryingAd) return
         // 零截图主链路：广告层是原生 View，一次全树遍历就能看出它挂上来了。
-        // · 横屏没有可读文案，靠分区几何（左上返回 + 右上「上滑」胶囊 + 底部通栏条三区齐）；
-        //   竖屏额外要求「全屏观看」可见，证明画面在播放器里而不是信息流。
-        // · 竖屏广告层自带「上滑继续观看短剧」提示条，这是广告自己写进树里的话，
-        //   38 拍实测恒为 上右3~4 底条4 可见74（正片播放 上右2 底条0 可见131），配 700ms 就够。
+        // · 竖屏广告层自带「上滑继续观看短剧」提示条，同时把播放器的「全屏观看」整块盖掉；
+        //   这两条都是广告自己写进树里的话，跟机型/分辨率无关：Mi 10 24 帧真广告 24/24 全召回，
+        //   正片里残留提示条的 3 帧都带「全屏观看」，靠 playerUi 挡掉。
+        // · 横屏读不到文案，只能退回分区几何，再用正片保护词（倍速/热评/作者声明…）兜住误判。
         // · 还要连续挂够：实测切集动画那一拍会短暂凑齐三区
         //（00:29:59 竖屏 上左3 上右12 底条2 可见202，只活了 1 秒），广告则一挂几十秒。
         // 宁可漏跳也不能在信息流里误划 —— 快速上滑曾被广告卡片吃成深链。
@@ -846,6 +890,30 @@ class AdSkipAccessibilityService : AccessibilityService() {
                 structStreak = 0
                 structAdSince = 0L
                 stopStructNudge()
+                // 空树广告层：广告创意整块画在 canvas/Lynx 里，原生壳只剩 41 个可见节点、0 条文案
+                //（Mi 10 实测：正片基线 118~181，这条广告 41，持续 2 分钟；切集黑屏同理但只活一两秒）。
+                // 差分而非绝对阈值：基线每台设备自己学，换机型不用改常数。
+                // 只认竖屏：横屏全屏播放器（ShortSeriesLandActivity）同样是「0 文案 + 43~44 节点」，
+                // 与空树广告在树里完全同形（11-03 实测误判连划 3 次）。横屏没有可用的差分量。
+                val canvasAd = !sig.landscape && sig.texts.isEmpty() && playerVisBase >= PLAYER_BASE_MIN &&
+                    sig.vis >= 8 && sig.vis <= CANVAS_RATIO * playerVisBase &&
+                    lastPlayerFrameAt > 0 && beat - lastPlayerFrameAt <= PLAYER_WINDOW_MS
+                if (canvasAd) {
+                    if (canvasAdSince == 0L) {
+                        canvasAdSince = beat
+                        logDebug("空树广告疑似 可见=${sig.vis} 基线=${playerVisBase.toInt()}")
+                    }
+                    // 广告挂多久都要能撑住：把「玩家窗口」一直续到最后一拍，
+                    // 否则长广告过了 30 秒窗口就自己失效了
+                    lastPlayerFrameAt = beat
+                    if (beat - canvasAdSince >= CANVAS_HOLD_MS) {
+                        canvasAdSince = 0L
+                        onAdDetected("空树广告层", currentTime)
+                        return
+                    }
+                } else if (canvasAdSince != 0L) {
+                    canvasAdSince = 0L
+                }
             }
         }
         val detected = detectAdFor(pkg, sig?.texts ?: lastScreenTexts)
@@ -1875,6 +1943,31 @@ class AdSkipAccessibilityService : AccessibilityService() {
 }
 
 /**
+ * 正片反向闸门（社区 ad-auto 同款）：命中任意一词就认为播放器正片 UI 还在，整屏不算广告。
+ * K40 1496 帧正片覆盖 99.4%，而 Mi 10 三条真竖屏广告帧全部不命中。
+ * 「选集/已完结」故意不进闸门 —— 00:51:40 那条真广告帧里这行选集条还挂在屏上。
+ *
+ * 解锁卡三条来自 T18 静态反编译（res/r/cyn.xml）：那一页上滑 = 进全屏广告，
+ * 是红果自己 string/g5t「向上滑动进入全屏广告」说的，命中就绝不出手。
+ */
+private val PLAY_GUARD_RE = Regex(
+    "倍速|热评|分享|收藏|评论|下一集|全集|作者声明|跟播|点赞|弹幕|展开|暂停|剧备字|第\\d+集" +
+        "|试看结束|看广告支持正版|暂不解锁|开会员解锁|向上滑动进入全屏广告"
+)
+
+/** 正片标题里的集号：两台机器 1496 帧正片全带，广告（原生/空树）都不带 */
+private val EPISODE_RE = Regex("第\\d+集")
+
+/**
+ * 竖屏广告提示条的文案族。T18 从红果 7.4.3.32 资源表抠出四种：
+ * 上滑继续观看短剧(bxk)、继续上滑观看短剧(fhg)、上滑继续看短剧(cex)、
+ * %1$ds后可继续上滑观看短剧(ffz)。倒计时那型不含「上滑继续」，
+ * 11-03 实测 15:01:51 它先挂 1.8 秒才轮到 pill，只认「上滑继续」会晚一拍、fhg 型则整条漏跳。
+ * 放宽只认「继续上滑 + 短剧」这一种搭配，不碰泛化文案（离线 358 帧里 2 帧命中全是广告帧）。
+ */
+private val HINT_TEXT_RE = Regex("上滑继续|继续上滑(观看|看)?短剧")
+
+/**
  * 无障碍树分区签名：四个几何区里「可见」的节点数 + 两条关键文案，全部按屏幕宽高归一化，与分辨率无关。
  * 横屏剧间广告没有可读文案，只能靠几何（左上返回 + 右上「上滑」胶囊 + 底部通栏条三区齐）；
  * 竖屏剧间广告自带「上滑继续观看短剧」提示条，且会把播放器的「全屏观看」整块盖掉。
@@ -1889,15 +1982,28 @@ private data class ZoneSig(
     val landscape: Boolean,
     val playerUi: Boolean,
     val hintText: Boolean,
+    val playGuard: Boolean,
+    val ids: List<String>,
     val texts: List<String>
 ) {
     /** 横屏广告层的分区几何：左上返回 + 右上「上滑」胶囊 + 底部通栏条三区齐 */
-    val adLike: Boolean get() = ul >= 1 && ur >= 1 && bb >= 1
+    val adGeo: Boolean get() = ul >= 1 && ur >= 1 && bb >= 1 && !playGuard
 
-    /** 竖屏广告层：自带「上滑继续…」提示条，且播放器控件整块被盖住
-     *  （实测 4 次广告恒为 上右3~8 底条4~5 可见74~103 且「全屏观看」不可见；
-     *   正片播放 上右2 底条0 可见131；广告退场那一拍 上右2 底条2 可见160 且「全屏观看」已回到树上） */
-    val verticalAd: Boolean get() = !landscape && hintText && !playerUi && ur >= 3 && bb >= 3
+    /**
+     * 横屏还要带上「广告」合规角标（右上 pill 旁的「广告 ⌄」）才认：
+     * 真横屏广告实测 上左2 上右5 底条1 角标=true；横屏播放器控件也能凑齐三区，
+     * 只是靠 playGuard（标题里的「第N集」）先挡了一道，角标是第二道。
+     */
+    val adLike: Boolean get() = adGeo && adTag
+
+    /**
+     * 竖屏广告层：红果自己写进树的「上滑继续观看短剧」这一句就是充分证据，跟屏幕尺寸、
+     * dpi 无关（Mi 10 竖屏 24 帧真广告实测 24/24 全召回，而正片帧里这句根本不出现）。
+     * 原先还要求「右上≥3 且 底条≥3」的绝对节点个数 —— 那是在 Mi 10 上调出来的，同一批
+     * 真广告帧里有 6 帧右上=0 被漏判，换到 K40 正片态就已经是「右上2 底条2」，差 1 就误判。
+     * 个数只保留给读不到文案的横屏降级路径用。
+     */
+    val verticalAd: Boolean get() = !landscape && hintText && !playerUi
 
     val adScreen: Boolean get() = (landscape && adLike) || verticalAd
 

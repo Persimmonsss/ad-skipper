@@ -11,8 +11,8 @@ android {
         applicationId = "com.example.hongguo_adskipper"
         minSdk = 24
         targetSdk = 34
-        versionCode = 40
-        versionName = "2.5.9"
+        versionCode = 43
+        versionName = "2.6.2"
     }
 
     buildTypes {
