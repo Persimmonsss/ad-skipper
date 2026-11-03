@@ -242,6 +242,10 @@ class AdSkipAccessibilityService : AccessibilityService() {
         private const val STRUCT_HOLD_MS = 1500L
         // 竖屏广告自带「上滑继续观看短剧」文案，是广告层自己的话，不用等那么久
         private const val HINT_HOLD_MS = 700L
+        // 倒计时型提示条（「3s后可继续上滑观看短剧」）在倒计时结束前滑动会被广告层吃掉，
+        // 读到 x 秒就把出手时刻钉在 x 秒后（+300ms 余量），最多认 20 秒，防误读把等待拉太长
+        private const val COUNTDOWN_CAP_SEC = 20
+        private const val COUNTDOWN_MARGIN_MS = 300L
         // 空树广告（canvas/Lynx 渲染，整棵树一个字都不进）没有文案可依，只能比「可见节点数」：
         // 正片基线每台设备自己学，落到 55% 以下且持续 4 秒才算 —— 切集黑屏只活一两秒，挡在外面。
         private const val CANVAS_HOLD_MS = 4000L
@@ -270,6 +274,9 @@ class AdSkipAccessibilityService : AccessibilityService() {
     private var structSampleAt = 0L
     // 本轮广告签名第一次出现的时刻（0 = 当前没有签名），用来量「挂了多久」
     private var structAdSince = 0L
+    // 倒计时型广告：第一次读到「x秒后」的时刻与最大秒数，出手时刻 = 起点 + x 秒
+    private var countdownAdSince = 0L
+    private var countdownSecs = 0
     // 正片可见节点数基线：每台设备自己学，空树广告靠它做差分判定（绝对阈值跨机型必失效）
     private var playerVisBase = 0f
     private var lastPlayerFrameAt = 0L
@@ -591,6 +598,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
         val wins = try { windows.size } catch (e: Exception) { -1 }
         Log.d(TAG, "探针Z 上左=${sig.ul} 上右=${sig.ur} 底中=${sig.bm} 底条=${sig.bb} " +
             "可见=${sig.vis} 横屏=${sig.landscape} 播放器控件=${sig.playerUi} 提示条=${sig.hintText} " +
+            (if (sig.hintCountdown > 0) "倒计时=${sig.hintCountdown}s " else "") +
             "守卫=${sig.playGuard} 窗口=$wins 判广告=$sign 文案[${sig.texts.take(5).joinToString(" ")}] " +
             "id[${sig.ids.joinToString(" ")}]")
     }
@@ -613,6 +621,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
         var seen = 0
         var playerUi = false
         var hintText = false
+        var hintCountdown = 0
         var playGuard = false
         val texts = ArrayList<String>(24)
         val ids = ArrayList<String>(10)
@@ -629,7 +638,13 @@ class AdSkipAccessibilityService : AccessibilityService() {
                 // 只有真在播放页才会「全屏观看」可见（实测 00:04:47 信息流广告卡片就是靠这条挡掉的）
                 if (label.contains("全屏观看")) playerUi = true
                 // 广告层自己写进树里的提示条：竖屏「上滑继续观看短剧」，横屏同理带这条
-                if (HINT_TEXT_RE.containsMatchIn(label)) hintText = true
+                if (HINT_TEXT_RE.containsMatchIn(label)) {
+                    hintText = true
+                    // 「3s后可继续上滑观看短剧」：倒计时没走完前滑动会被广告吃掉
+                    val m = COUNTDOWN_RE.find(label)
+                    val n = m?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                    if (n > hintCountdown) hintCountdown = n
+                }
                 // 正片 UI 的反向闸门：命中即整屏不算广告（宁漏勿误）
                 if (!playGuard && PLAY_GUARD_RE.containsMatchIn(label)) playGuard = true
                 if (texts.size < 24) texts.add(label)
@@ -670,7 +685,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
             }
         }
         walk(rootNode, 0)
-        val sig = ZoneSig(ul, ur, bm, bb, vis, false, sw > sh, playerUi, hintText, playGuard, ids, texts)
+        val sig = ZoneSig(ul, ur, bm, bb, vis, false, sw > sh, playerUi, hintText, hintCountdown, playGuard, ids, texts)
         // 「广告」合规角标只在判据已经成立后才查：findAccessibilityNodeInfosByText 是跨进程查询，
         // 每个事件都问一遍是主线程被拖死的原因之一。横屏必须先查它才能定 adLike，所以按 adGeo 提前。
         return if (!sig.adScreen && !sig.adGeo) sig else sig.copy(adTag = try {
@@ -832,6 +847,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
             // 旧 streak 会让回来后的第一帧直接凑成第 2 拍（单帧确认，遇过渡画面就可能误滑）
             structStreak = 0
             structAdSince = 0L
+            countdownAdSince = 0L
+            countdownSecs = 0
             stopStructNudge()
             // 空树广告的计时也不能跨 App 残留：否则切回来第一帧就可能直接判定并划走
             canvasAdSince = 0L
@@ -840,6 +857,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
             if (lastLandscape != null && lastLandscape != sig.landscape) {
                 structStreak = 0
                 structAdSince = 0L
+                countdownAdSince = 0L
+                countdownSecs = 0
                 canvasAdSince = 0L
                 stopStructNudge()
                 logDebug("方向切换 ${if (sig.landscape) "横屏" else "竖屏"}，重新计数")
@@ -873,14 +892,27 @@ class AdSkipAccessibilityService : AccessibilityService() {
                 structStreak++
                 val held = beat - structAdSince
                 val need = if (byText) HINT_HOLD_MS else STRUCT_HOLD_MS
+                // 倒计时型：「3s后可继续上滑观看短剧」在秒数没走完前滑动会被广告层吃掉
+                //（11-03 15:11 实测首划白费，2.9 秒后才靠重试划走）。读到 x 秒就钉住出手时刻。
+                if (byText && sig.hintCountdown > 0 && countdownAdSince == 0L) {
+                    countdownAdSince = beat
+                    countdownSecs = sig.hintCountdown.coerceAtMost(COUNTDOWN_CAP_SEC)
+                    logDebug("倒计时提示条 ${sig.hintCountdown}秒，${countdownSecs * 1000L + COUNTDOWN_MARGIN_MS}ms 后再划")
+                }
+                val gateAt = if (countdownAdSince > 0L)
+                    countdownAdSince + countdownSecs * 1000L + COUNTDOWN_MARGIN_MS else 0L
+                // 文案里秒数消失（只剩纯提示条）说明倒计时已结束，不必再等到点
+                val gateOk = gateAt == 0L || beat >= gateAt || sig.hintCountdown == 0
                 logDebug(
                     "结构广告层 第${structStreak}拍 已挂${held}ms " +
                         (if (byText) "提示条文案 上右${sig.ur} 底条${sig.bb}" else "上左${sig.ul} 上右${sig.ur} 底条${sig.bb}") +
                         if (sig.adTag) " 带广告角标" else ""
                 )
-                if (held >= need && structStreak >= STRUCT_STREAK_NEED) {
+                if (held >= need && structStreak >= STRUCT_STREAK_NEED && gateOk) {
                     structStreak = 0
                     structAdSince = 0L
+                    countdownAdSince = 0L
+                    countdownSecs = 0
                     stopStructNudge()
                     onAdDetected(if (byText) "上滑继续看短剧" else "结构:广告层", currentTime)
                     return
@@ -889,6 +921,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
             } else {
                 structStreak = 0
                 structAdSince = 0L
+                countdownAdSince = 0L
+                countdownSecs = 0
                 stopStructNudge()
                 // 空树广告层：广告创意整块画在 canvas/Lynx 里，原生壳只剩 41 个可见节点、0 条文案
                 //（Mi 10 实测：正片基线 118~181，这条广告 41，持续 2 分钟；切集黑屏同理但只活一两秒）。
@@ -1967,6 +2001,9 @@ private val EPISODE_RE = Regex("第\\d+集")
  */
 private val HINT_TEXT_RE = Regex("上滑继续|继续上滑(观看|看)?短剧")
 
+/** 提示条里的剩余秒数：「3s后」「3秒后」「3 秒 后」都是同一型 */
+private val COUNTDOWN_RE = Regex("(\\d{1,2})\\s*[秒sS]\\s*后")
+
 /**
  * 无障碍树分区签名：四个几何区里「可见」的节点数 + 两条关键文案，全部按屏幕宽高归一化，与分辨率无关。
  * 横屏剧间广告没有可读文案，只能靠几何（左上返回 + 右上「上滑」胶囊 + 底部通栏条三区齐）；
@@ -1982,6 +2019,7 @@ private data class ZoneSig(
     val landscape: Boolean,
     val playerUi: Boolean,
     val hintText: Boolean,
+    val hintCountdown: Int,
     val playGuard: Boolean,
     val ids: List<String>,
     val texts: List<String>
