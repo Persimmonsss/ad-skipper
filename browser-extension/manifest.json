@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "跳跳狐 · 视频广告跳过",
-  "version": "0.2.0",
-  "version_name": "0.2.0",
+  "version": "0.2.1",
+  "version_name": "0.2.1",
   "description": "跳过 B 站视频内嵌的恰饭片段（跳过后 3 秒内可撤回），并自动切走抖音网页版信息流里的广告。与跳跳狐 App 同一套落点规则。",
   "permissions": ["storage"],
   "host_permissions": [
@@ -19,13 +19,13 @@
   "options_page": "options.html",
   "content_scripts": [
     {
-      "matches": ["https://www.bilibili.com/video/*"],
+      "matches": ["https://www.bilibili.com/video/*", "https://www.bilibili.com/festival/*"],
       "js": ["content.js"],
       "css": ["content.css"],
       "run_at": "document_idle"
     },
     {
-      "matches": ["https://www.bilibili.com/video/*"],
+      "matches": ["https://www.bilibili.com/video/*", "https://www.bilibili.com/festival/*"],
       "js": ["main-world.js"],
       "world": "MAIN",
       "run_at": "document_start"

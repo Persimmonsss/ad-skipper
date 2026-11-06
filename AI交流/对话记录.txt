@@ -1969,3 +1969,32 @@ T18 资源表里还有一型「继续上滑观看短剧」(string/fhg)，按旧�
   最可能是通知使用权仍是「未开启」（v2.7.0 测试后恢复成未开启），或 B站开关 / 暂停全部跳过被关。
   等 Mi 10 上线后核对这三处。
 - 测试设备：K40（只做 B站 诊断，未做红果广告测试）。
+
+────────────────────────────────────────
+[11-06 18:05] 浏览器插件不支持活动页，已修（v0.2.1）
+一、用户现象
+- 「手机可以跳吗，我刚刚浏览器不行诶」：同一条节日页链接，浏览器插件没跳。
+二、根因（两处，都在插件侧）
+1. `manifest.json` 的 content_scripts 只匹配 `https://www.bilibili.com/video/*`，
+   节日页 `/festival/S16?bvid=BV…` 根本不注入。实测连 `/video/BV1Ly4i6AEGH` 也会被 B站
+   重定向回 `/festival/S16?bvid=`，所以这条视频在浏览器里只有改匹配范围这一条路。
+2. 取号逻辑写死 `/video/(BV…)` + `__INITIAL_STATE__.videoData`；节日页没有 `videoData`，
+   BV 在 `videoInfo.bvid`、cid 在 `videoInfo.pages[0].cid`，链接里也没有 `/video/`。
+   另外实测换集时 `toBvid` 停在首次打开那条（不更新），不能用它当首选，否则拿上一集的广告段跳当前集。
+三、改动
+- `manifest.json`：video / festival 两类页面都注入（content.js 与 main-world.js 两条），版本 0.2.0 → 0.2.1。
+- `main-world.js`：新增 `currentBvid()`，顺序＝路径 BV → `?bvid=` → `videoData.bvid` → `videoInfo.bvid`；
+  `vd = videoData || videoInfo`，cid 仍按 `?p=` 取当前 P。
+- `content.js`：`pageIdentity()` 的 URL 兜底同样认 `?bvid=`。
+四、实测（Edge 真装未打包扩展 + CDP，只发 evaluate 与合成点击，不动用户键鼠）
+- festival 主链路 + 换集 8/8：认出 `bvid=BV1Ly4i6AEGH / cid=43368514114`，社区库 1 段（bsbsb.top），
+  预置 170 秒 → 自动跳到 221.36 秒，日志「跳过生效，当前 03:42（目标 03:41）」；
+  换集后重新绑定 `BV1YK4e6nEaD / cid=43367926957`（时长 276 秒），没有沿用旧段。
+- 普通视频页回归 3/3：`BV1njnn6yEMY` 预置 365 → 跳到 475.52 秒。
+- 备注：本机 curl `bsbsb.top` 有一次 15 秒超时（exit 28），插件内 8 秒中止后会自动退到 bsbsb.cc，不影响结果。
+五、用户侧要做的一步
+- 你的 Chrome 是以「加载未打包扩展」直接指向仓库 `browser-extension/` 目录的，
+  改完代码要去 `chrome://extensions` 点该卡片的「重新加载」，否则还跑旧脚本（匹配范围变更必须重载）。
+六、手机侧结论（复述）
+- 手机 App 能跳这条：K40 v2.6.3 实测 `会话 seek 02:58→03:41`、`seek 生效（会话），当前 03:42`。
+  Mi 10 无线 adb 仍不可达，等上线核对通知使用权 / B站开关 / 暂停全部跳过。

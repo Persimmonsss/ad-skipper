@@ -75,7 +75,11 @@
     } catch (e) {
       parsed = {};
     }
-    const fromUrl = (location.pathname.match(/\/video\/(BV[0-9A-Za-z]{10})/) || [])[1] || "";
+    // 活动页的 BV 只在 ?bvid= 里；这里同样先取链接再取主世界写的 data，换集时能早 300ms 认出来
+    const fromUrl =
+      (location.pathname.match(/(BV[0-9A-Za-z]{10})/) || [])[1] ||
+      (/(BV[0-9A-Za-z]{10})/.exec(new URLSearchParams(location.search).get("bvid") || "") || [])[1] ||
+      "";
     return { bvid: fromUrl || parsed.bvid || "", cid: parsed.cid || "" };
   }
 

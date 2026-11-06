@@ -284,9 +284,10 @@ Android 免 root 广告跳过 App（无障碍服务实现），App 内显示名�
 - 模拟器（MuMu）上红果不投剧内广告，红果分支只能在真机验收
 
 
-## 浏览器插件（B 站内嵌广告，v1 实测通过）
+## 浏览器插件（B 站内嵌广告，v0.2.1 实测通过）
 
-`browser-extension/`，Chrome / Edge 的 MV3 扩展，只作用于 `www.bilibili.com/video/*`。
+`browser-extension/`，Chrome / Edge 的 MV3 扩展，作用于 `www.bilibili.com/video/*` 和
+`www.bilibili.com/festival/*`（活动/合集页，0.2.1 起支持）。
 方案和 App 侧一致：同一串镜像（`bsbsb.top → bsbsb.cc → www.bsbsb.xyz`）、只认 `sponsor` 分类、
 提前 3 秒倒计时、直接 seek 到段尾、3 秒内可点「撤回」回到广告前 2 秒、落点同样钳在片尾前 1.5 秒。
 
@@ -300,7 +301,12 @@ Android 免 root 广告跳过 App（无障碍服务实现），App 内显示名�
 - BV / cid 识别：`__INITIAL_STATE__` 在 MAIN world，内容脚本（isolated world）读不到，
   所以另有一条 `"world": "MAIN"` 的脚本把 `{bvid, cid}` 写进 `documentElement.dataset` 跨世界共享。
   **多 P 页面里 `videoData.cid` 恒等于第一 P**（实测 `?p=3` 时它还是 P1 的 cid），
-  必须按 URL 的 `?p=` 去 `pages[]` 取当前 P，否则会拿别的分 P 的标注来跳
+  必须按 URL 的 `?p=` 去 `pages[]` 取当前 P，否则会拿别的分 P 的标注来跳。
+  活动页（`/festival/S16?bvid=BV…`）结构完全不同：没有 `videoData`，BV 在 `videoInfo.bvid`、
+  cid 在 `videoInfo.pages[0].cid`，链接里也没有 `/video/`，所以取号顺序是
+  路径 BV → `?bvid=` → `videoData.bvid` → `videoInfo.bvid`。
+  **`toBvid` 不能用**：实测点合集换集，URL 的 `?bvid=` 和 `videoInfo` 都跟着换，`toBvid` 停在首次打开那条，
+  拿它当首选就会用上一集的广告段来跳当前集
 - 缓存按 BV 存、不分 cid（6 小时 TTL），切分 P 在本地过滤，省一次网络请求；
   404 与「200 + 空数组」都计为未命中
 - 气泡整层 `pointer-events:none`，只有「撤回」按钮可点，不吃页面上的正常点击；
@@ -314,7 +320,9 @@ Android 免 root 广告跳过 App（无障碍服务实现），App 内显示名�
    加载后主链路 12/12 全通；「纯 ASCII 路径」只是 App 打包时的要求，插件不需要）；
 2. Edge 开 `edge://extensions`、Chrome 开 `chrome://extensions`，打开「开发人员模式」；
 3. 「加载未打包的扩展」→ 选 `browser-extension` 目录；
-4. 打开任意 B 站视频页即生效，无需登录、无需其它权限。
+4. 打开任意 B 站视频页即生效，无需登录、无需其它权限；
+5. 改过插件代码后要回扩展页点该卡片的「重新加载」，否则页面继续跑旧脚本（改 `manifest.json`
+   的匹配范围也必须重载，光刷新页面不生效）。
 
 自动化验收踩坑（写给下次）：Chrome 156 稳定版已经**忽略** `--load-extension`（headless 与 headed
 都只加载内置扩展，profile 里 `extensions.settings` 为 0 条）；Edge 156 还认，但只在**全新
@@ -328,6 +336,13 @@ user-data-dir** 时生效，复用旧 profile 会静默不注入。
 - 全屏 6/6、总开关 4/4（关掉后 11 秒播过广告段不跳）、多 P cid 3/3、无标注 3/3、后台单测 4/4、开关页 11/11
 - 数据源自检实测输出：已标注「命中 1 段（来自 https://bsbsb.cc）06:13–07:56 cid=42869984501」，
   未标注「社区库里这条没有 sponsor 标注（https://bsbsb.cc 返回 404）」
+
+v0.2.1 活动页（同一套 Edge 真装 + CDP 驱动）：
+
+- `/festival/S16?bvid=BV1Ly4i6AEGH` 8/8：认出 `bvid=BV1Ly4i6AEGH / cid=43368514114`、
+  社区库 1 段、预置 170 秒后自动跳到 221.36 秒（段尾 221.136，日志「跳过生效，当前 03:42（目标 03:41）」）、
+  点合集换集后重新绑定成 `BV1YK4e6nEaD / cid=43367926957`（时长 276 秒，不再用上一集的段跳）
+- 普通视频页回归 3/3：`BV1njnn6yEMY` 预置 365 秒 → 跳到 475.52 秒，取号和跳过都没被上面的改动影响
 
 已知限制（不是 bug）：只对社区库已标注的视频生效；只接了 `sponsor` 分类，B站 网页贴片、
 充电/恰饭片头不在范围；标签页在后台时 B站 自己会暂停播放，暂停不跳是预期行为；只能开发者模式加载。
