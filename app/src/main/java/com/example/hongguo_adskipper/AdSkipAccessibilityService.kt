@@ -663,7 +663,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
         Log.d(TAG, "探针Z 上左=${sig.ul} 上右=${sig.ur} 底中=${sig.bm} 底条=${sig.bb} " +
             "可见=${sig.vis} 横屏=${sig.landscape} 播放器控件=${sig.playerUi} 提示条=${sig.hintText} " +
             (if (sig.hintCountdown > 0) "倒计时=${sig.hintCountdown}s " else "") +
-            "守卫=${sig.playGuard} 窗口=$wins 判广告=$sign 文案[${sig.texts.take(5).joinToString(" ")}] " +
+            "守卫=${sig.playGuard} 直播面=${sig.liveRender} 窗口=$wins 判广告=$sign 文案[${sig.texts.take(5).joinToString(" ")}] " +
             "id[${sig.ids.joinToString(" ")}]")
     }
 
@@ -687,6 +687,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
         var hintText = false
         var hintCountdown = 0
         var playGuard = false
+        var liveRender = false
         val texts = ArrayList<String>(24)
         val ids = ArrayList<String>(10)
         fun walk(n: AccessibilityNodeInfo, d: Int) {
@@ -695,6 +696,9 @@ class AdSkipAccessibilityService : AccessibilityService() {
             if (!n.isVisibleToUser) return
             vis++
             val vid = n.viewIdResourceName
+            // 直播广告的渲染面：穿山甲直播 SDK 自己的资源名（不是红果的混淆短名，改版稳）。
+            // 正剧用 SurfaceView 播，树里不会出现这一枚；直播卡片整屏是视频，文案全画在视频层里。
+            if (!liveRender && vid != null && vid.endsWith(LIVE_RENDER_ID_SUFFIX)) liveRender = true
             val label = n.text?.toString()?.trim()?.ifEmpty { null }
                 ?: n.contentDescription?.toString()?.trim()?.ifEmpty { null }
             if (label != null) {
@@ -749,7 +753,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
             }
         }
         walk(rootNode, 0)
-        val sig = ZoneSig(ul, ur, bm, bb, vis, false, sw > sh, playerUi, hintText, hintCountdown, playGuard, ids, texts)
+        val sig = ZoneSig(ul, ur, bm, bb, vis, false, sw > sh, playerUi, hintText, hintCountdown,
+            playGuard, liveRender, ids, texts)
         // 「广告」合规角标只在判据已经成立后才查：findAccessibilityNodeInfosByText 是跨进程查询，
         // 每个事件都问一遍是主线程被拖死的原因之一。横屏必须先查它才能定 adLike，所以按 adGeo 提前。
         return if (!sig.adScreen && !sig.adGeo) sig else sig.copy(adTag = try {
@@ -955,6 +960,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
         // 宁可漏跳也不能在信息流里误划 —— 快速上滑曾被广告卡片吃成深链。
         if (sig != null) {
             val byText = sig.verticalAd
+            val byLive = !byText && sig.liveAd
             if (sig.adScreen) {
                 if (structAdSince == 0L) structAdSince = beat
                 structStreak++
@@ -973,7 +979,11 @@ class AdSkipAccessibilityService : AccessibilityService() {
                 val gateOk = gateAt == 0L || beat >= gateAt || sig.hintCountdown == 0
                 logDebug(
                     "结构广告层 第${structStreak}拍 已挂${held}ms " +
-                        (if (byText) "提示条文案 上右${sig.ur} 底条${sig.bb}" else "上左${sig.ul} 上右${sig.ur} 底条${sig.bb}") +
+                        (when {
+                            byText -> "提示条文案 上右${sig.ur} 底条${sig.bb}"
+                            byLive -> "直播渲染面"
+                            else -> "上左${sig.ul} 上右${sig.ur} 底条${sig.bb}"
+                        }) +
                         if (sig.adTag) " 带广告角标" else ""
                 )
                 if (held >= need && structStreak >= STRUCT_STREAK_NEED && gateOk) {
@@ -982,7 +992,14 @@ class AdSkipAccessibilityService : AccessibilityService() {
                     countdownAdSince = 0L
                     countdownSecs = 0
                     stopStructNudge()
-                    onAdDetected(if (byText) "上滑继续看短剧" else "结构:广告层", currentTime)
+                    onAdDetected(
+                        when {
+                            byText -> "上滑继续看短剧"
+                            byLive -> "直播广告"
+                            else -> "结构:广告层"
+                        },
+                        currentTime
+                    )
                     return
                 }
                 scheduleStructNudge()
@@ -2083,6 +2100,9 @@ private val PLAY_GUARD_RE = Regex(
 /** 正片标题里的集号：两台机器 1496 帧正片全带，广告（原生/空树）都不带 */
 private val EPISODE_RE = Regex("第\\d+集")
 
+/** 穿山甲直播 SDK 渲染面的资源名后缀（完整形如 com.phoenix.read:id/ttlive_player_render_view） */
+private const val LIVE_RENDER_ID_SUFFIX = "/ttlive_player_render_view"
+
 /**
  * 竖屏广告提示条的文案族。T18 从红果 7.4.3.32 资源表抠出四种：
  * 上滑继续观看短剧(bxk)、继续上滑观看短剧(fhg)、上滑继续看短剧(cex)、
@@ -2112,6 +2132,7 @@ private data class ZoneSig(
     val hintText: Boolean,
     val hintCountdown: Int,
     val playGuard: Boolean,
+    val liveRender: Boolean,
     val ids: List<String>,
     val texts: List<String>
 ) {
@@ -2134,8 +2155,16 @@ private data class ZoneSig(
      */
     val verticalAd: Boolean get() = !landscape && hintText && !playerUi
 
-    val adScreen: Boolean get() = (landscape && adLike) || verticalAd
+    /**
+     * 直播广告（Mi 10 11-07 14:04 实锤）：整屏是直播画面，「点击进入直播间」「直播中」
+     * 「上滑继续看短剧」全画在视频层里，树里只剩一句「立即领取」，提示条/几何/空树三条判据
+     * 同时失效，广告挂了 4 分钟一次没划。唯一进树的强证据是穿山甲直播 SDK 的渲染面。
+     * 只上滑、绝不点：这一屏点中任何一块都是进直播间。
+     */
+    val liveAd: Boolean get() = !landscape && liveRender && !playerUi && !playGuard
+
+    val adScreen: Boolean get() = (landscape && adLike) || verticalAd || liveAd
 
     /** 结构签名能否独立判定这一屏（判不了才允许退回截图复核） */
-    val decidable: Boolean get() = landscape || playerUi || hintText
+    val decidable: Boolean get() = landscape || playerUi || hintText || liveAd
 }
