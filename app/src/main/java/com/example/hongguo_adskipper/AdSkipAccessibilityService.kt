@@ -49,6 +49,9 @@ class AdSkipAccessibilityService : AccessibilityService() {
         private const val TAG = "AdSkipService"
         private const val CHANNEL_ID = "ad_skip_channel"
         private const val NOTIFICATION_ID = 1
+        // 常驻通知的最小重发间隔：通知内容只有计数和暂停态，秒级刷新肉眼无差，
+        // 省下的是广告动画期主线程上的 binder + RemoteViews 重建
+        private const val NOTIF_MIN_GAP_MS = 1200L
 
         private val HONGGUO_PACKAGES = listOf(
             "com.phoenix.read",
@@ -88,6 +91,10 @@ class AdSkipAccessibilityService : AccessibilityService() {
         private const val SWIPE_DELAY_MS = 3000L
         private const val MAX_CONSECUTIVE_SWIPES = 3
         private const val RESET_TIMEOUT_MS = 10000L
+        // 手势从命中到真正派发正常只有 0.2~0.55 秒；主线程被事件洪压住或进程被系统冻结时
+        // 会拖到几十秒（Mi 10 实测 12:05:53 排的手势 12:07:31 才跑），这时屏幕早就不是那条广告，
+        // 照着划就是在正片上乱划。超过这个时长直接丢弃，交给轮询重新确认。
+        private const val STALE_SWIPE_MS = 2500L
         // 红果广告层底部「上滑继续看短剧」提示条的位置（1080×2340 基准）与匹配阈值
         // 提示条模板匹配：多模板池（assets/ad_hint*.png），底部大范围搜索（matchHint 内实现），
         // 不再用固定坐标/固定尺寸（红果提示条排版与位置随广告渲染浮动）
@@ -158,17 +165,41 @@ class AdSkipAccessibilityService : AccessibilityService() {
             "welcome_ad_view_skip",
             "ad_skip_text",
             "only_skip_rl",
-            "beizi_interstitial_ad_close",        // 倍孜（聚合前缀一起命中）
+            "beizi_interstitial_ad_close",        // 倍孜
             "splash_ad_close",                    // 闲鱼（实测命中）
             "tv_skip",                            // 小蚕（实测命中）
             "btn_skip",
             // 以下补自 GKD 两份官方订阅 + SKIP 规则库（社区跨订阅重复出现，非我们自创）
-            "mjumpbtn",                           // 京东读书
-            "iv_jump",                            // 华尔街见闻（含 iv_jump_parent）
-            "adview_jump",                        // 科沃斯
             "jump_over",                          // vivo 系
             "vlion_ad_closed",                    // CSDN 穿山甲封装
-            "homesplash_close_fullscreen"         // 菜鸟
+            "homesplash_close_fullscreen",        // 菜鸟
+            // v2.7.4 补自 GKD 五份社区订阅 195 组开屏规则的跨订阅高频具名件。
+            // 只补下面这两条「语义正则看不出来」的：广告词和关闭词被 item 隔开了。
+            // 其余社区短名（csj_splash_skip、buuh_splash_skip、adCloseButton、skipAd、
+            // splash_close_layout、navi_ad_close、cd_appstore_splash_skip…）由 AD_SKIP_ID 统一收下。
+            // 明确不补的：ksad_ / csj_ / gdt_ / anythink_ 这类前缀族——社区自己注明它们是
+            // 「父级容器锚点」，规则安全靠父级契约撑着，我们照抄就等于去点整块广告容器。
+            "msa_splash_item_close_tv",           // 美数（美团系）开屏关闭
+            "jl_splash_close"                     // 三家订阅重复出现的开屏关闭件
+            // 同时撤掉上一轮只凭「社区重复出现」收下的 mjumpbtn / iv_jump / adview_jump：
+            // 这轮把 195 组原文扒开看，jump 系短名在订阅里的原文注释是
+            // 「广告跳转按钮，父级需为 ad/splash/close 语义」——它既可能是跳过键，
+            // 也可能是广告入口本身。我们没有父级契约，这三条又从来没有现场命中记录，按底线不赌。
+        )
+        /**
+         * 语义复合：短名里「广告 / 开屏 / 插屏」和「跳过 / 关闭」要挨着出现才算跳过件。
+         * 社区规则表里出现次数最高的其实是 `x`、`close`、`iv_close`、`timer` 这类裸短名，
+         * 它们靠「规则锚定到某个 App 的某个页面 + 父容器还要匹配 ad/splash」才安全，
+         * 我们没有父容器契约，按 contains 收下就等于让「关闭弹幕」「点击下载」也能命中
+         * ——正是用户划红线的地方，所以一律不收。
+         * 反过来 `ad_sensor_view`、`iv_adsensor`（摇一摇）、`feedAdItem2`（信息流广告本体）
+         * 这几个社区确实在点的短名更明确排除：点它们就是点进广告。
+         * 词首约束（^ 或分隔符之后）是为了挡住 thread_close、upload_skip 这种
+         * 字母凑巧连成 "ad_close"、"ad_skip" 的无关控件。
+         */
+        private val AD_SKIP_ID = Regex(
+            """(^|[_-])(ad|ads|splash|interstitial|fullad)[_-]?(skip|close)""" +
+                """|(^|[_-])(skip|close)[_-]?(ad|ads)([_-]|$)"""
         )
         private val SPLASH_SKIP_PKGS = listOf(
             // pkg=android 是系统框架窗口（音量条、权限弹窗、Toast 容器），实测红果播放时
@@ -180,7 +211,34 @@ class AdSkipAccessibilityService : AccessibilityService() {
             "miui.systemui.plugin", "com.miui.systemui", "com.miui.securitycenter",
             "com.miui.rom", "com.android.providers.media",
             // 聊天类界面里「关闭/跳过」字样到处都是，误点代价最高（GKD 开屏组同样把它们整组关掉）
-            "com.tencent.mm", "com.tencent.mobileqq"
+            "com.tencent.mm", "com.tencent.mobileqq",
+            // ===== 以下取自 GKD 五份订阅的「不参与自动化」清单，但只挑误触代价不可承受的类别 =====
+            // 那份清单共 668 个包，整表照抄会把斗鱼（我们的开屏正样本）、快手、微博、小红书一起关掉：
+            // 它记的是「这个订阅没给这个 App 写规则」，不是「这个 App 不能点」。
+            // 钱与账号：点错一下是转账、绑卡、买基金，不是一条广告
+            "com.eg.android.AlipayGphone", "com.unionpay", "com.chinatelecom.bestpayclient",
+            "com.lakala.sh", "com.shhk.change.wallet", "cmb.pb", "cn.com.spdb.mobilebank.per",
+            "com.bankcomm.Bankcomm", "com.chinamworld.main", "com.chinamworld.bocmbci",
+            "com.yitong.mbank.psbc", "com.ecitic.bank.mobile", "com.cebbank.mobile.cemb",
+            "com.bank.gz.cmbc.b2c.mobilebank", "com.szsmk.lenying", "com.hexin.plat.android",
+            "com.eastmoney.android.fund", "com.pywm.fund", "com.xueqiu.fund",
+            "com.sinosoft.lifechaiyangwang", "com.zy.fosbx",
+            // 政务与医疗：办理的是证件、挂号，页面上的「关闭」是流程按钮不是广告
+            "com.example.servyouappzhuhai", "com.tmri.app.main", "com.hanweb.android.zhejiang.activity",
+            "me.chunyu.ChunyuDoctor", "com.haoshilei.doctorweb", "com.zhf.helse",
+            // 企业数据：WPS / 企业微信里一个「关闭」可能是关掉别人发的文档
+            "com.tencent.wework", "com.kingsoft", "cn.wjxcloud.wjx",
+            // 渠道游戏开屏是误触下载的重灾区（用户原话：待会给我装别的软件就完了）
+            "com.mihoyo.bh3", "com.netease.mrzhna",
+            // 厂商系统控制面与输入法：MIUI 分屏、负一屏之外，这些页面同样不归我们点
+            "com.miui.hybrid", "com.baidu.input",
+            "com.huawei.systemmanager", "com.huawei.numberidentity", "com.huawei.android.internal.app",
+            "com.hihonor.id", "com.hihonor.health", "com.hihonor.mms", "com.hihonor.camera",
+            "com.hihonor.android.totemweather",
+            "com.heytap.health", "com.heytap.openid", "com.coloros.healthcheck", "com.coloros.note",
+            "com.oneplus.note", "com.oplus.camera", "com.oplus.nas",
+            "com.vivo.gallery", "com.vivo.deviceinfo", "com.vivo.doclist", "com.vivo.dream.music",
+            "com.vivo.localmusic", "com.android.vivo.tws.vivotws", "com.android.BBKClock"
         )
 
         // ========== 统计数据 ==========
@@ -254,11 +312,12 @@ class AdSkipAccessibilityService : AccessibilityService() {
         // 读到 x 秒就把出手时刻钉在 x 秒后（+300ms 余量），最多认 20 秒，防误读把等待拉太长
         private const val COUNTDOWN_CAP_SEC = 20
         private const val COUNTDOWN_MARGIN_MS = 300L
-        // 空树广告（canvas/Lynx 渲染，整棵树一个字都不进）没有文案可依，只能比「可见节点数」：
-        // 正片基线每台设备自己学，落到 55% 以下且持续 4 秒才算 —— 切集黑屏只活一两秒，挡在外面。
-        private val canvasHoldMs: Long
+        // 广告层差分：广告盖住播放器时原生壳只剩广告自己的控件，可见节点数会大跌。
+        // 正片基线每台设备自己学（EMA 0.8/0.2），落到基线 70% 以下且连挂够时长才算广告 ——
+        // 切集黑屏同理但只活一两秒，被时长门槛挡在外面。用比例而非绝对个数，换机型不用改常数。
+        private val layerHoldMs: Long
             get() = when (Settings.speedTier) { 2 -> 3200L; 0 -> 5500L; else -> 4000L }
-        private const val CANVAS_RATIO = 0.55f
+        private const val LAYER_RATIO = 0.70f
         private const val PLAYER_BASE_MIN = 60f
         private const val PLAYER_WINDOW_MS = 30_000L
         // 追拍上限：12 × 220ms ≈ 2.6 秒，够确认一次，又不会变成常驻轮询
@@ -285,13 +344,18 @@ class AdSkipAccessibilityService : AccessibilityService() {
     private var structSampleAt = 0L
     // 本轮广告签名第一次出现的时刻（0 = 当前没有签名），用来量「挂了多久」
     private var structAdSince = 0L
+    // 最近一帧仍判为广告的时刻：手势出手前用它复核「广告还在屏上」，
+    // 排在队列里太久的手势（实测晚 98 秒）不能照着划正片。
+    private var lastAdFrameAt = 0L
+    // 待出手手势的排队时刻（elapsedRealtime），超过 STALE_SWIPE_MS 就丢弃
+    private var swipeQueuedAt = 0L
     // 倒计时型广告：第一次读到「x秒后」的时刻与最大秒数，出手时刻 = 起点 + x 秒
     private var countdownAdSince = 0L
     private var countdownSecs = 0
     // 正片可见节点数基线：每台设备自己学，空树广告靠它做差分判定（绝对阈值跨机型必失效）
     private var playerVisBase = 0f
     private var lastPlayerFrameAt = 0L
-    private var canvasAdSince = 0L
+    private var layerAdSince = 0L
     // 签名挂上后自己追拍的次数（静态广告不再推 CONTENT_CHANGED，只等事件确认要 2 秒）
     private var structNudges = 0
     private val structNudge = Runnable {
@@ -354,6 +418,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
         if (!handler.hasCallbacks(biliTicker)) handler.postDelayed(biliTicker, 1000L)
     }
 
+    private var lastNotifAt = 0L
+
     override fun onCreate() {
         super.onCreate()
         Settings.init(this)
@@ -366,7 +432,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
             biliBubble.hide()
             undoBubble.hide()
         }
-        updateNotification()
+        updateNotification(force = true)
     }
 
     override fun onServiceConnected() {
@@ -481,7 +547,15 @@ class AdSkipAccessibilityService : AccessibilityService() {
         return Notification.Action.Builder(icon, if (paused) "恢复" else "暂停", pi).build()
     }
 
-    private fun updateNotification() {
+    /** 暂停状态这类用户能立刻察觉的变化用 force 立刻刷，其余走节流。 */
+    private fun updateNotification(force: Boolean = false) {
+        // 这条通知只在文案真的变了才有必要重发，而 buildNotification 要读两次
+        // SharedPreferences、重建一次 RemoteViews 再走一次 binder。广告动画期
+        // 「结构广告层 第N拍」这类日志约 4.5 条/秒，逐条重建通知会把主线程吃满，
+        // 表现就是命中后那次上滑迟迟不执行（实测晚到近百秒）。
+        val now = SystemClock.elapsedRealtime()
+        if (!force && now - lastNotifAt < NOTIF_MIN_GAP_MS) return
+        lastNotifAt = now
         getSystemService(NotificationManager::class.java)
             .notify(NOTIFICATION_ID, buildNotification())
     }
@@ -582,7 +656,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
     }
 
     /** 滑动节流 + 连续滑动预算：命中后统一在 onAdDetected 里检查，避免事件驱动下重复滑动。 */
-    private fun canSwipeNow(now: Long): Boolean {        if (now - lastSwipeTime < SWIPE_DELAY_MS) return false
+    private fun canSwipeNow(now: Long): Boolean {
+        if (now - lastSwipeTime < SWIPE_DELAY_MS) return false
         if (consecutiveSwipes >= MAX_CONSECUTIVE_SWIPES) {
             if (now - lastAdDetectedTime <= RESET_TIMEOUT_MS) return false
             consecutiveSwipes = 0
@@ -710,8 +785,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
                     hintText = true
                     // 「3s后可继续上滑观看短剧」：倒计时没走完前滑动会被广告吃掉
                     val m = COUNTDOWN_RE.find(label)
-                    val n = m?.groupValues?.get(1)?.toIntOrNull() ?: 0
-                    if (n > hintCountdown) hintCountdown = n
+                    val secs = m?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                    if (secs > hintCountdown) hintCountdown = secs
                 }
                 // 正片 UI 的反向闸门：命中即整屏不算广告（宁漏勿误）
                 if (!playGuard && PLAY_GUARD_RE.containsMatchIn(label)) playGuard = true
@@ -924,7 +999,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
             countdownSecs = 0
             stopStructNudge()
             // 空树广告的计时也不能跨 App 残留：否则切回来第一帧就可能直接判定并划走
-            canvasAdSince = 0L
+            layerAdSince = 0L
+            lastAdFrameAt = 0L
         } else if (sig != null) {
             // 全屏时用户可能旋转屏幕：方向一变两套判据整体换向，旧方向的计数不能算数
             if (lastLandscape != null && lastLandscape != sig.landscape) {
@@ -932,7 +1008,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
                 structAdSince = 0L
                 countdownAdSince = 0L
                 countdownSecs = 0
-                canvasAdSince = 0L
+                layerAdSince = 0L
                 stopStructNudge()
                 logDebug("方向切换 ${if (sig.landscape) "横屏" else "竖屏"}，重新计数")
             }
@@ -962,6 +1038,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
             val byText = sig.verticalAd
             val byLive = !byText && sig.liveAd
             if (sig.adScreen) {
+                lastAdFrameAt = beat
                 if (structAdSince == 0L) structAdSince = beat
                 structStreak++
                 val held = beat - structAdSince
@@ -1009,34 +1086,44 @@ class AdSkipAccessibilityService : AccessibilityService() {
                 countdownAdSince = 0L
                 countdownSecs = 0
                 stopStructNudge()
-                // 空树广告层：广告创意整块画在 canvas/Lynx 里，原生壳只剩 41 个可见节点、0 条文案
-                //（Mi 10 实测：正片基线 118~181，这条广告 41，持续 2 分钟；切集黑屏同理但只活一两秒）。
-                // 差分而非绝对阈值：基线每台设备自己学，换机型不用改常数。
-                // 只认竖屏：横屏全屏播放器（ShortSeriesLandActivity）同样是「0 文案 + 43~44 节点」，
-                // 与空树广告在树里完全同形（11-03 实测误判连划 3 次）。横屏没有可用的差分量。
-                val canvasAd = !sig.landscape && sig.texts.isEmpty() && playerVisBase >= PLAYER_BASE_MIN &&
-                    sig.vis >= 8 && sig.vis <= CANVAS_RATIO * playerVisBase &&
+                // 广告层差分：正片基线 30 秒内学过、当前可见节点掉到基线 70% 以下、
+                // 且屏上再没有任何正片证据（集号 / 作者声明 / 全屏观看 / 保护词）。
+                // 取代原来的「必须零文案」：Mi 10 实测一条半空树创意只剩 51 个节点 + 一句「立即领取」，
+                // 挂 3 分 30 秒、44 拍全判 0 —— 旧条件被那一个词挡死，而这种"画面全画在 canvas 里、
+                // 只留一枚按钮"的形态是广告创意里最常见的一种。节点差分量本身机型无关。
+                // 只认竖屏：横屏全屏播放器本来就只有 44~66 个节点，与广告同形，没有差分量。
+                val layerAd = !sig.landscape && playerVisBase >= PLAYER_BASE_MIN &&
+                    sig.vis >= 8 && sig.vis <= LAYER_RATIO * playerVisBase &&
+                    !sig.playerUi && !sig.playGuard &&
+                    sig.texts.none {
+                        EPISODE_RE.containsMatchIn(it) || it.contains("作者声明") || it.contains("全屏观看")
+                    } &&
                     lastPlayerFrameAt > 0 && beat - lastPlayerFrameAt <= PLAYER_WINDOW_MS
-                if (canvasAd) {
-                    if (canvasAdSince == 0L) {
-                        canvasAdSince = beat
-                        logDebug("空树广告疑似 可见=${sig.vis} 基线=${playerVisBase.toInt()}")
+                if (layerAd) {
+                    lastAdFrameAt = beat
+                    if (layerAdSince == 0L) {
+                        layerAdSince = beat
+                        logDebug(
+                            "广告层差分 可见=${sig.vis} 基线=${playerVisBase.toInt()} " +
+                                "剩${sig.texts.size}条文案[${sig.texts.take(3).joinToString(" ")}]"
+                        )
                     }
                     // 广告挂多久都要能撑住：把「玩家窗口」一直续到最后一拍，
                     // 否则长广告过了 30 秒窗口就自己失效了
                     lastPlayerFrameAt = beat
-                    if (beat - canvasAdSince >= canvasHoldMs) {
-                        canvasAdSince = 0L
-                        onAdDetected("空树广告层", currentTime)
+                    if (beat - layerAdSince >= layerHoldMs) {
+                        layerAdSince = 0L
+                        onAdDetected("广告层差分", currentTime)
                         return
                     }
-                } else if (canvasAdSince != 0L) {
-                    canvasAdSince = 0L
+                } else if (layerAdSince != 0L) {
+                    layerAdSince = 0L
                 }
             }
         }
         val detected = detectAdFor(pkg, sig?.texts ?: lastScreenTexts)
         if (detected) {
+            lastAdFrameAt = beat
             onAdDetected(lastAdKeyword, currentTime)
         } else {
             // 当前不是广告，检查上一次滑动是否成功
@@ -1047,10 +1134,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
             }
         }
 
-        // 定期更新通知（每10次检查更新一次，避免太频繁）
-        if (screenCheckCount % 10 == 0) {
-            updateNotification()
-        }
+        // 通知由 logDebug 节流刷新，这里不再按拍数重复重建
     }
 
     /** 命中广告后的统一动作：计数、记日志、延迟上滑、再复核。 */
@@ -1073,18 +1157,35 @@ class AdSkipAccessibilityService : AccessibilityService() {
         lastSwipeTime = currentTime
         Counters.inc(SkipStat.HG_SKIP)
         sendStatsBroadcast()
-        handler.postDelayed({
-            if (performSwipeUp()) {
-                logDebug("已执行滑动 第${consecutiveSwipes}次")
-                showUndoBubble(consecutiveSwipes.toLong())
-                // 延迟后再检查一次，判断是否成功跳过
-                handler.postDelayed({
-                    checkSwipeResult()
-                }, 2000)
-            } else {
-                logDebug("滑动未执行：红果已不在前台")
-            }
-        }, adWaitMs())
+        // 同一条广告只保留最后一次排队：实测一次横屏直播广告连命中 3 次，
+        // 三条排队手势在 98 秒后一起爆发，把正片连划了三下。
+        handler.removeCallbacks(pendingSwipe)
+        swipeQueuedAt = SystemClock.elapsedRealtime()
+        handler.postDelayed(pendingSwipe, adWaitMs())
+    }
+
+    /**
+     * 排队到点的手势：先核对「没过期 + 广告还在屏上」再划。
+     * 主线程被事件洪压住或进程被系统冻结时，延时会从 0.3 秒涨到几十秒，
+     * 这时界面上早就不是刚才那条广告了，宁可漏跳也不能在正片上乱划。
+     */
+    private val pendingSwipe = Runnable {
+        val now = SystemClock.elapsedRealtime()
+        val queued = now - swipeQueuedAt
+        if (queued > STALE_SWIPE_MS) {
+            logDebug("手势排队${queued}ms 已过期，丢弃")
+        } else if (now - lastAdFrameAt > STALE_SWIPE_MS) {
+            logDebug("出手前复核：广告已不在界面（${now - lastAdFrameAt}ms 前），丢弃")
+        } else if (performSwipeUp()) {
+            logDebug("已执行滑动 第${consecutiveSwipes}次")
+            showUndoBubble(consecutiveSwipes.toLong())
+            // 延迟后再检查一次，判断是否成功跳过
+            handler.postDelayed({
+                checkSwipeResult()
+            }, 2000)
+        } else {
+            logDebug("滑动未执行：红果已不在前台")
+        }
     }
 
     /** 出手前的人类反应延时：快档 150~300ms，平衡 200~400ms，稳档 300~550ms。 */
@@ -1725,10 +1826,42 @@ class AdSkipAccessibilityService : AccessibilityService() {
     private var splashMatchInfo = ""
     private var lastSplashClickKey = ""
 
+    // 本轮开屏窗口的取证。缺这组数，「有时不好使」永远分不出是四种漏跳里的哪一种：
+    // 拿不到树（空转）、画在拿不到的子窗口、纯图无节点、还是按钮确实像但被闸挡掉了。
+    private var splashScans = 0
+    private var splashAdScans = 0
+    // 活动/聚焦窗口里拿不到这个包的根：广告画在我们根本枚举不到的窗口上，只能记一笔
+    private var splashEmptyRoots = 0
+    private var splashBlankTree = 0
+    private var splashReject = ""
+
+    /** 窗口收场：到期、切走、被新窗口顶掉都收口，留一行取证说明这一条开屏走到了哪一步。 */
+    private fun closeSplashWindow(why: String) {
+        val pkg = splashPkg ?: return
+        splashPkg = null
+        handler.removeCallbacks(splashTicker)
+        val outcome = when {
+            splashSuccessCounted -> "已跳掉"
+            splashSkipCounted -> "点了没复核到"
+            splashDetected -> "认出没点着"
+            splashAdScans > 0 -> "见广告面没见过按钮"
+            else -> "没见广告"
+        }
+        logDebug(
+            "开屏收场 ${pkg.substringAfterLast('.')} $outcome（$why）" +
+                " 扫${splashScans}拍 无根${splashEmptyRoots} 无文案${splashBlankTree}" +
+                if (splashReject.isNotEmpty()) " 挡掉「$splashReject」" else ""
+        )
+    }
+
     /** 开屏窗口出现后独立轮询若干秒：广告窗口常常不产生无障碍事件。 */
     private val splashTicker = object : Runnable {
         override fun run() {
             val now = SystemClock.elapsedRealtime()
+            if (splashPkg != null && now > splashUntil) {
+                closeSplashWindow("到期")
+                return
+            }
             if (now > splashUntil || !screenOn() || Settings.paused || splashPkg == null) return
             try {
                 scanSplashOnce(now)
@@ -1754,6 +1887,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
             splashUntil = maxOf(splashUntil, now + SPLASH_WINDOW_MS)
             return
         }
+        // 上一个包的窗口还没收场就切进了新 App：先补一行取证，否则那轮扫描到底卡在哪一步就查不到了
+        closeSplashWindow("被新窗口顶掉")
         splashPkg = pkg
         splashWindowStart = now
         splashUntil = now + SPLASH_WINDOW_MS
@@ -1768,6 +1903,12 @@ class AdSkipAccessibilityService : AccessibilityService() {
         splashTreeLogs = 0
         lastSplashDigest = ""
         lastSplashClickKey = ""
+        splashScans = 0
+        splashAdScans = 0
+        splashEmptyRoots = 0
+        splashBlankTree = 0
+        splashReject = ""
+        Stats.splashLastPkg = pkg
         handler.removeCallbacks(splashTicker)
         handler.post(splashTicker)
         logDebug("开屏窗口 $pkg")
@@ -1787,11 +1928,9 @@ class AdSkipAccessibilityService : AccessibilityService() {
             // 给过渡 800ms 宽限，过了还停在目标 App 上才算真的没切换。
             if (splashNodeClicks == 0 && now - splashWindowStart < 800L) return
             if (active != null && (splashNodeClicks > 0 || TARGET_PACKAGES.contains(active))) {
-                logDebug("开屏扫描停止(active=$active)")
                 // 置空 splashPkg 才能真正停：ticker 的 run() 在本函数返回后还会无条件下一次
                 // postDelayed，只 removeCallbacks 会被自己重新挂上（实测每 250ms 刷一条停止日志）
-                splashPkg = null
-                handler.removeCallbacks(splashTicker)
+                closeSplashWindow("前台已换成${active.substringAfterLast('.')}")
             }
             return
         }
@@ -1801,9 +1940,13 @@ class AdSkipAccessibilityService : AccessibilityService() {
         if (now - lastSplashClick < SPLASH_CLICK_CD_MS) return
         if (now - lastSplashScan < SPLASH_SCAN_STEP_MS) return
         lastSplashScan = now
+        splashScans++
 
         val roots = splashRoots(pkg)
-        if (roots.isEmpty()) return
+        if (roots.isEmpty()) {
+            splashEmptyRoots++
+            return
+        }
         // 点过跳过按钮后，若某一拍既找不到跳过按钮、也不像广告面，说明开屏真的被跳掉了；
         // 6 秒内没等到就放弃这一条的复核（预算用尽后扫描会提前 return，不能无限等）
         if (splashClosedPending) {
@@ -1866,11 +2009,15 @@ class AdSkipAccessibilityService : AccessibilityService() {
             return
         }
         val samples = roots.flatMap { sampleList(it, 8) }
+        // 有根、有节点，但一个字都采不到：这就是画在 canvas/Lynx 里的纯图开屏，
+        // 树里没有可点的跳过件，按底线只能放弃（记下来才知道这种形态还有多少）
+        if (samples.isEmpty()) splashBlankTree++
         val adSurface = looksLikeSplashAd(roots, samples)
         splashAdStreak = if (adSurface) splashAdStreak + 1 else 0
         // 广告特征连续两拍才认，避免普通页面里一两个“广告”字样就续期
         val confirmedAd = splashAdStreak >= 2
         if (confirmedAd) {
+            splashAdScans++
             if (!splashDetected) {
                 splashDetected = true
                 Counters.inc(SkipStat.SPLASH_DETECT)
@@ -1944,15 +2091,19 @@ class AdSkipAccessibilityService : AccessibilityService() {
         // 不可见的「跳过」可能是上一屏广告留下的残骸，点它等于朝空气落指、
         // 甚至点到已经被它盖住的首页按钮上，一律不认。
         val visible = node.isVisibleToUser
+        // 文案/id 命中只在可见节点上算：开了 flagIncludeNotImportantViews 之后树里大量不可见节点，
+        // 提前短路是白省一趟正则（这一层每 300ms 全树走一遍，主线程还要腾出来给红果划广告）
+        val labelHit = visible && (isSkipLabel(text) || isSkipLabel(desc))
+        val idHit = visible && isSkipViewId(id)
         if (visible && isCornerCountdown(node)) {
             splashMatchInfo = "倒计时数字「${node.text ?: node.contentDescription}」"
             return node // 倒计时数字只认它自己可点，往上爬会点到广告或角标容器
         }
-        if (visible && (isSkipLabel(text) || isSkipLabel(desc)) && node.childCount == 0 && isButtonSized(node)) {
+        if (labelHit && node.childCount == 0 && isButtonSized(node)) {
             splashMatchInfo = "text=$text desc=$desc id=$id"
             return node // 点「跳过」这两个字本身，不去点可点的祖先（实测祖先常是广告容器）
         }
-        if (visible && isSkipViewId(id) && isButtonSized(node)) {
+        if (idHit && isButtonSized(node)) {
             // 按 id 命中只许点「按钮自己」或「同样只有按钮尺寸的可点祖先」。实测晓晓优选
             // (TopOn 聚合)的 tobid_splash_skip_text 往上爬到的可点 RelativeLayout 是整块广告热区，
             // 点它直接触发深链，被 MIUI 拦成「晓晓优选 想要打开 美团」。
@@ -1963,6 +2114,19 @@ class AdSkipAccessibilityService : AccessibilityService() {
                 splashMatchInfo = "id=$id 点击区${box.width()}x${box.height()}"
                 return target
             }
+        }
+        // 只记证、不改判定：像跳过键却被下面三道闸挡掉的，留一条给收场日志。
+        // 漏跳到底是「尺寸档太紧」「按钮带子节点」还是「整条不可点」，决定下一步该放宽哪一条
+        if (splashReject.isEmpty() && (labelHit || idHit)) {
+            val box = Rect()
+            node.getBoundsInScreen(box)
+            val name = text.ifBlank { desc }.ifBlank { id.substringAfterLast('/') }.take(12)
+            val why = when {
+                labelHit && node.childCount > 0 -> "带${node.childCount}个子节点"
+                !isButtonSized(node) -> "${box.width()}x${box.height()}超按钮档"
+                else -> "自己与祖先都不可点"
+            }
+            splashReject = "$name·$why"
         }
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
@@ -2004,8 +2168,16 @@ class AdSkipAccessibilityService : AccessibilityService() {
         if (id.isEmpty()) return false
         if (id.contains("download") || id.contains("update")) return false
         val short = id.substringAfterLast('/')
+        // 摇一摇触发件、信息流广告本体：点下去就是进广告，社区在点的是它们各自的关闭件。
+        // 带 setting 的是「关闭广告推荐」这类开关（社区表里的 settings_close_advertisement），
+        // 点它是替用户改了别的 App 的隐私设置，比误点一下广告更不该我们动手。
+        // 这一条放在所有表前面，后面再扩表也不会把这类入口放进来
+        if (short.contains("sensor") || short.contains("shake") || short.contains("feedad") ||
+            short.contains("setting")
+        ) return false
         // 社区验证过的具名跳过件（高置信）
         if (SPLASH_SKIP_IDS.any { short.contains(it) }) return true
+        if (AD_SKIP_ID.containsMatchIn(short)) return true
         // 倒计时件：短名同时含 count 与 down（download 已在上面排除，挡住「点击下载」假跳过）
         if (short.contains("count") && short.contains("down")) return true
         // 泛匹配兜新 SDK 的命名；splash_ad / ad_container 这类广告容器名不在表里，也绝不能当跳过键
@@ -2014,17 +2186,17 @@ class AdSkipAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * 只有按钮尺寸的节点才允许点。旧口径是「小于半屏宽 × 四分之一屏高」，
-     * 在 1080 屏上等于允许 540×600 —— 一块盖住大半屏的广告卡片也能过审，太松。
-     * 业界口径用绝对像素（GKD 默认订阅小关闭键 130、AIsouler 无形 View 用 200），
-     * 这里取 300×200：比业界略松（为了不丢已实测命中的 tv_skip/count_down/tobid 121×54），
-     * 但已经把「全屏热区冒充按钮」这条路从几何上切断。
+     * 只有按钮尺寸的节点才允许点。上限按 dp 算，不按绝对像素：跳过键是 dp 尺寸，
+     * 屏密度越高它的像素越大，写死 300×200 会在高分屏上把真按钮判成「太大不像按钮」而漏跳
+     * （参考机 Mi 10 密度 2.75，110dp×73dp 换过来就是原先的 300×200，两台在用机器上等价）。
+     * 再叠一层屏幕占比，把「全屏热区冒充按钮」这条路从几何上切断。
      */
     private fun isButtonSized(node: AccessibilityNodeInfo): Boolean {
         val b = Rect()
         node.getBoundsInScreen(b)
         val screen = currentScreenBounds()
-        return b.width() in 1..300 && b.height() in 1..200 &&
+        val d = resources.displayMetrics.density
+        return b.width() in 1..(110f * d).toInt() && b.height() in 1..(73f * d).toInt() &&
             b.width() < screen.width() * 0.28f && b.height() < screen.height() * 0.09f
     }
 
@@ -2076,10 +2248,13 @@ class AdSkipAccessibilityService : AccessibilityService() {
         super.onDestroy()
         isServiceEnabled = false
         if (instance === this) instance = null
-        handler.removeCallbacks(periodicCheck)
-        handler.removeCallbacks(biliTicker)
-        handler.removeCallbacks(structNudge)
+        // 一条清干净：逐个 removeCallbacks 早晚会漏掉新加的 runnable。
+        // 漏掉的 splashTicker 会在服务销毁后继续 250ms 自投，拿着已失效的窗口树
+        // 找「跳过」并按坐标落指（进程不会随服务销毁退出，这条尾巴能挂到下次冷启）
+        handler.removeCallbacksAndMessages(null)
         shotExecutor.shutdownNow()
+        biliBubble.hide()
+        undoBubble.hide()
         Log.d(TAG, "服务已销毁")
     }
 }
@@ -2160,8 +2335,12 @@ private data class ZoneSig(
      * 「上滑继续看短剧」全画在视频层里，树里只剩一句「立即领取」，提示条/几何/空树三条判据
      * 同时失效，广告挂了 4 分钟一次没划。唯一进树的强证据是穿山甲直播 SDK 的渲染面。
      * 只上滑、绝不点：这一屏点中任何一块都是进直播间。
+     *
+     * 横屏同样要认（Mi 10 11-07 23:18 实锤）：横屏直播广告实测 `上左1 上右3 底条0 可见39 直播面=true`，
+     * 横屏几何判据要「底条≥1」而这一屏根本没有底条，挂了 70 秒一次没划。原先加 `!landscape` 是
+     * 怕横屏误判，但横屏正片实测直播面恒为 false（23:07/23:09/23:19 多帧），漏跳的代价落在用户身上。
      */
-    val liveAd: Boolean get() = !landscape && liveRender && !playerUi && !playGuard
+    val liveAd: Boolean get() = liveRender && !playerUi && !playGuard
 
     val adScreen: Boolean get() = (landscape && adLike) || verticalAd || liveAd
 
