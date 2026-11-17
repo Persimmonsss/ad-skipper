@@ -319,7 +319,17 @@ class AdSkipAccessibilityService : AccessibilityService() {
             get() = when (Settings.speedTier) { 2 -> 3200L; 0 -> 5500L; else -> 4000L }
         private const val LAYER_RATIO = 0.70f
         private const val PLAYER_BASE_MIN = 60f
+        // 候选未出手落行的门槛：挂够这么久、同一种挡法隔这么久再记，免得加载态刷满台账
+        private const val CAND_HOLD_MS = 1500L
+        private const val CAND_LOG_GAP_MS = 30000L
+        // 静默样本的采样间隔：判据一条都没擦边时，每这么久留一行树形快照。
+        // 10 分钟一行 = 每小时最多 6 行，台账留 200 行够回看三十多个小时的屏幕时间，
+        // 再密就要开始挤掉真正的广告行了。
+        private const val SAMPLE_GAP_MS = 600_000L
         private const val PLAYER_WINDOW_MS = 30_000L
+        // 红果已知放短剧的两个界面。差分/直播面这些判据只在播放器上成立，台账里凡是别的
+        // 界面名都单独记一行：那是「判据出手位置不对」这类事故的唯一现场线索。
+        private val PLAYER_ACTIVITIES = setOf("ShortSeriesActivity", "ShortSeriesLandActivity")
         // 追拍上限：12 × 220ms ≈ 2.6 秒，够确认一次，又不会变成常驻轮询
         private const val STRUCT_NUDGE_MAX = 12
 
@@ -356,6 +366,21 @@ class AdSkipAccessibilityService : AccessibilityService() {
     private var playerVisBase = 0f
     private var lastPlayerFrameAt = 0L
     private var layerAdSince = 0L
+    // 台账用的三个时刻：命中（elapsedRealtime）、差分候选起点、候选上次落行时刻
+    private var adHitAt = 0L
+    private var layerCandSince = 0L
+    private var layerCandLogAt = 0L
+    private var sampleLogAt = 0L
+    // 台账用的界面名片：红果当前是哪个 Activity，只在窗口事件里拿得到（无障碍没有查别的应用
+    // 前台 Activity 的接口）。判据只按包名收口，一旦在商城/听书这类页面上划一下就是事故，
+    // 所以每条广告行都要带上当时站在哪个界面；服务比红果晚绑上时会是"未知"，直到下一次窗口事件。
+    private var hongguoActivity = "未知"
+    private val seenHongguoActivities = mutableSetOf<String>()
+    // 红果在前台却连续取不到树：判据全盲，和「这段就没广告」在记录上长得一模一样，得单独落一行
+    private var nullRootStreak = 0
+    private var nullRootLogAt = 0L
+    // 上一次落进台账的闸门状态（null = 本进程还没落过），用来只在真的变化时补一行
+    private var gateNoted: String? = null
     // 签名挂上后自己追拍的次数（静态广告不再推 CONTENT_CHANGED，只等事件确认要 2 秒）
     private var structNudges = 0
     private val structNudge = Runnable {
@@ -587,6 +612,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
                 else -> pkg
             }
             foregroundAt = SystemClock.elapsedRealtime()
+            if (HONGGUO_PACKAGES.contains(pkg)) noteHongguoActivity(event.className?.toString().orEmpty())
             try {
                 maybeBlockAdDeepLink(pkg)
             } catch (e: Exception) {
@@ -842,6 +868,17 @@ class AdSkipAccessibilityService : AccessibilityService() {
     // ==================== 定时轮询 ====================
 
     private fun performPeriodicCheck() {
+        // 台账整段安静，第一件要排除的是"它当时根本没在跑"：手动暂停、关了红果开关、服务重新绑定，
+        // 都会让记录断流却看不出原因。这里只在状态真的变了时落一行，顺带当成"服务在线"的心跳标记。
+        val gate = when {
+            Settings.paused -> "手动暂停，期间不跳广告"
+            !Settings.hongguoEnabled -> "红果开关已关"
+            else -> "运行中"
+        }
+        if (gate != gateNoted) {
+            gateNoted = gate
+            AdLog.note("跳跳狐 $gate")
+        }
         if (!screenOn() || Settings.paused) return
         // 前台归属每拍都以活动窗口校正：窗口事件会把前台包名顶到系统浮层上，而
         // 「30 秒兜底刷新」只要还有窗口事件进来就会被无限推迟，永远等不到
@@ -867,8 +904,19 @@ class AdSkipAccessibilityService : AccessibilityService() {
             if (screenCheckCount % 20 == 0) {
                 logDebug("等待窗口... (检查${screenCheckCount}次)")
             }
+            // 红果在前台却读不到树 = 判据全盲，和「这段本来就没广告」在台账里长得一模一样。
+            // 轮询约 1.2 秒一拍，攒到 25 拍（约 30 秒）落一行，说明这段时间工具确实是瞎的。
+            if (HONGGUO_PACKAGES.contains(foregroundPkg)) {
+                nullRootStreak++
+                val blindAt = SystemClock.elapsedRealtime()
+                if (nullRootStreak >= 25 && blindAt - nullRootLogAt >= 60_000L) {
+                    nullRootLogAt = blindAt
+                    AdLog.note("红果@$hongguoActivity 取不到界面树 连续${nullRootStreak}拍（这段时间判据全盲，广告不会跳）")
+                }
+            }
             return
         }
+        nullRootStreak = 0
         val packageName = rootNode.packageName?.toString() ?: ""
         if (!TARGET_PACKAGES.contains(packageName)) {
             foregroundPkg = packageName
@@ -1019,9 +1067,18 @@ class AdSkipAccessibilityService : AccessibilityService() {
             if (!sig.landscape && sig.vis >= 40 &&
                 sig.texts.any { EPISODE_RE.containsMatchIn(it) || it.contains("作者声明") }
             ) {
-                playerVisBase = if (playerVisBase <= 0f) sig.vis.toFloat()
+                val firstBase = playerVisBase <= 0f
+                playerVisBase = if (firstBase) sig.vis.toFloat()
                     else playerVisBase * 0.8f + sig.vis * 0.2f
                 lastPlayerFrameAt = beat
+                // 基线是差分判据的分母：学不到（或学歪了）空树型广告就整类漏。
+                // 落这一行是为了把「这台机器整夜零记录」分成「没广告」和「差分根本没武装上」两种。
+                if (firstBase) {
+                    AdLog.note(
+                        "红果@$hongguoActivity 正片基线首学=${sig.vis}" +
+                            (if (sig.vis < PLAYER_BASE_MIN) " ←低于${PLAYER_BASE_MIN.toInt()}，差分暂不生效" else "")
+                    )
+                }
             }
         }
         // 倒计时重试循环进行中：红果还在同一广告页，轮询不再重复触发（避免耗尽连续滑动预算）
@@ -1122,6 +1179,26 @@ class AdSkipAccessibilityService : AccessibilityService() {
                 } else if (layerAdSince != 0L) {
                     layerAdSince = 0L
                 }
+                // 候选未出手：可见节点确实掉到基线 70% 以下、却被某道闸挡住的画面。只记不动手 ——
+                // 这是没人挂 adb 现场盯、也能发现「新形态漏跳」的通道之一。
+                // 连挂 1.5 秒以上才落一行（切集动画与加载中的瞬时掉节点不值得记），同一种挡法 30 秒内只记一次。
+                val blocked = if (layerAd) null else layerBlockedReason(sig, beat)
+                if (blocked == null) {
+                    layerCandSince = 0L
+                } else {
+                    if (layerCandSince == 0L) layerCandSince = beat
+                    if (beat - layerCandSince >= CAND_HOLD_MS && beat - layerCandLogAt >= CAND_LOG_GAP_MS) {
+                        layerCandLogAt = beat
+                        AdLog.note("红果@$hongguoActivity 候选未出手 挡住=$blocked" + sigFeature(sig, beat - layerCandSince))
+                    }
+                }
+                // 静默样本：这一帧三条判据一条都没擦边，还是每 10 分钟留一行树形快照。
+                // 「完全不在判据射程里的新形态广告」没有别的通道能事后发现 —— 台账整晚干净
+                // 和台账整晚没记录，只有靠这种采样行才分得开。
+                if (beat - sampleLogAt >= SAMPLE_GAP_MS) {
+                    sampleLogAt = beat
+                    AdLog.note("红果@$hongguoActivity 静默样本" + sigFeature(sig, 0))
+                }
             }
         }
         val detected = detectAdFor(pkg, sig?.texts ?: lastScreenTexts)
@@ -1156,6 +1233,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
         wasAdBeforeSwipe = true
 
         logDebug("广告命中:[$keyword] 剧:$dramaTitle 集:$currentEpisode")
+        adHitAt = SystemClock.elapsedRealtime()
         AdLog.start(adFeatureLine(keyword, sig, heldMs))
 
         lastSwipeTime = currentTime
@@ -1169,11 +1247,11 @@ class AdSkipAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * 台账一行的前半段：命中时刻那条广告在树上的全部特征。
-     * 分区/可见数/基线用来判形态，文案与 id 用来事后认出新形态，机型无关所以两台手机的行能直接对比。
+     * 台账一行的特征段：命中时刻那一帧在树上的全部读数。
+     * 分区/可见数/基线用来判形态，文案与 id 用来事后认出新形态；全是相对量，两台手机的行能直接对比。
      */
-    private fun adFeatureLine(keyword: String, sig: ZoneSig?, heldMs: Long): String {
-        if (sig == null) return "红果 判据=$keyword 无结构签名（退回文案判定）"
+    private fun sigFeature(sig: ZoneSig?, heldMs: Long): String {
+        if (sig == null) return " 无结构签名（退回文案判定）"
         val flags = buildString {
             if (sig.hintText) append(" 提示条")
             if (sig.hintCountdown > 0) append(" 倒计时${sig.hintCountdown}s")
@@ -1181,11 +1259,48 @@ class AdSkipAccessibilityService : AccessibilityService() {
             if (sig.adTag) append(" 角标")
             if (sig.playerUi) append(" 播放器控件")
         }
-        return "红果 判据=$keyword ${if (sig.landscape) "横屏" else "竖屏"}" +
-            " 分区${sig.ul}/${sig.ur}/${sig.bb} 可见${sig.vis}" +
-            (if (playerVisBase > 0f) "/基线${playerVisBase.toInt()}" else "") + flags +
-            (if (heldMs > 0) " 挂${heldMs}ms" else "") +
+        return " ${if (sig.landscape) "横屏" else "竖屏"} 分区${sig.ul}/${sig.ur}/${sig.bb}" +
+            " 可见${sig.vis}" + (if (playerVisBase > 0f) "/基线${playerVisBase.toInt()}" else "") +
+            flags + (if (heldMs > 0) " 挂${heldMs}ms" else "") +
             " 文案[${sig.texts.take(3).joinToString(" ")}] id[${sig.ids.take(3).joinToString(" ")}]"
+    }
+
+    private fun adFeatureLine(keyword: String, sig: ZoneSig?, heldMs: Long): String =
+        "红果@$hongguoActivity 判据=$keyword" + sigFeature(sig, heldMs)
+
+    /**
+     * 记红果当前的界面名，同一会话里每个新界面落一行。
+     * 判据按包名收口、不看界面，所以「在商城/听书页上划了一下」这类事故只有靠这份名片才查得出来；
+     * 反过来，整夜台账里只有 ShortSeriesActivity 也说明广告全在播放器内，不用扩页面白名单。
+     */
+    private fun noteHongguoActivity(cls: String) {
+        if (!cls.endsWith("Activity")) return
+        val simple = cls.substringAfterLast('.')
+        hongguoActivity = simple
+        if (!seenHongguoActivities.add(simple)) return
+        AdLog.note(
+            "红果 界面 $simple" +
+                (if (simple in PLAYER_ACTIVITIES) "" else " ←不是播放器界面，这里的广告判据本不该出手")
+        )
+    }
+
+    /**
+     * 这一帧算不算「像广告但被挡下」，返回挡住它的那道闸；不算候选就返回 null。
+     * 顺序跟 layerAd 一致，只有差分量成立（节点掉到基线 70% 以下）才继续问下去。
+     */
+    private fun layerBlockedReason(sig: ZoneSig, beat: Long): String? {
+        // 横屏全屏播放器本来就只有 44~66 个节点，与广告同形，没有差分量 —— 不制造噪声
+        if (sig.landscape || playerVisBase < PLAYER_BASE_MIN) return null
+        val inPlayerWindow = lastPlayerFrameAt > 0 && beat - lastPlayerFrameAt <= PLAYER_WINDOW_MS
+        if (sig.vis < 8) return if (inPlayerWindow) "近空树" else null
+        if (sig.vis > LAYER_RATIO * playerVisBase) return null
+        if (!inPlayerWindow) return "距上次正片>${PLAYER_WINDOW_MS / 1000}s"
+        if (sig.playerUi) return "播放器控件在屏"
+        if (sig.playGuard) return "保护词"
+        sig.texts.firstOrNull {
+            EPISODE_RE.containsMatchIn(it) || it.contains("作者声明") || it.contains("全屏观看")
+        }?.let { return "正片证据「${it.take(12)}」" }
+        return null
     }
 
     /**
@@ -1204,6 +1319,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
             AdLog.end("广告已自己收场，没划")
         } else if (performSwipeUp()) {
             logDebug("已执行滑动 第${consecutiveSwipes}次")
+            if (adHitAt > 0) AdLog.mark("出手+${now - adHitAt}ms")
             showUndoBubble(consecutiveSwipes.toLong())
             // 延迟后再检查一次，判断是否成功跳过
             handler.postDelayed({
@@ -1598,7 +1714,14 @@ class AdSkipAccessibilityService : AccessibilityService() {
 
         val sig = zoneSignature(rootNode)
         if (sig != null && sig.decidable) {
-            handleSwipeCheck(sig.adScreen, "结构 上左${sig.ul} 上右${sig.ur} 底条${sig.bb}")
+            // 复核帧把「正片证据」也带上：判据说离开了广告，可如果这一帧就是正片，
+            // 到底是广告收场了还是我们把正片划走了，只有这行能事后分清。
+            val ep = sig.texts.firstOrNull { EPISODE_RE.containsMatchIn(it) || it.contains("作者声明") }
+            handleSwipeCheck(
+                sig.adScreen,
+                "结构 上左${sig.ul} 上右${sig.ur} 底条${sig.bb} 可见${sig.vis}" +
+                    (if (ep != null) " 正片证据「${ep.take(12)}」" else "")
+            )
             return
         }
         sampleScreenMatch { score ->
@@ -1627,6 +1750,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
                 retryingAd = true
                 lockRetries = 0
                 logDebug("滑动可能失败，进入倒计时重试（$reason）")
+                AdLog.mark("首滑无效")
             }
             if (lockRetries < LOCK_RETRY_MAX) {
                 lockRetries++
@@ -1659,7 +1783,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
             retryingAd = false
             lockRetries = 0
             logDebug("滑动成功，已离开广告（$reason）")
-            AdLog.end("已离开广告（$reason）")
+            AdLog.end("已离开广告（$reason） 复核+${SystemClock.elapsedRealtime() - adHitAt}ms")
         }
         sendStatsBroadcast()
     }
@@ -1867,6 +1991,9 @@ class AdSkipAccessibilityService : AccessibilityService() {
     private var splashTreeLogs = 0
     private var lastSplashDigest = ""
     private var splashMatchInfo = ""
+    // 台账用：窗口开始到第一下点击的时延（-1 = 这条开屏一次都没点）
+    private var splashFirstClickMs = -1L
+    private var splashFirstClickInfo = ""
     private var lastSplashClickKey = ""
 
     // 本轮开屏窗口的取证。缺这组数，「有时不好使」永远分不出是四种漏跳里的哪一种：
@@ -1897,7 +2024,9 @@ class AdSkipAccessibilityService : AccessibilityService() {
         )
         AdLog.splash(
             "开屏 $pkg $outcome（$why） 扫${splashScans}拍 无根${splashEmptyRoots} 无文案${splashBlankTree}" +
-                (if (splashMatchInfo.isNotEmpty()) " 认到「$splashMatchInfo」" else "") +
+                (if (splashFirstClickMs >= 0) " 首点+${splashFirstClickMs}ms「$splashFirstClickInfo」" else "") +
+                (if (splashMatchInfo.isNotEmpty() && splashMatchInfo != splashFirstClickInfo)
+                    " 末次认到「$splashMatchInfo」" else "") +
                 (if (splashReject.isNotEmpty()) " 挡掉「$splashReject」" else "")
         )
     }
@@ -1956,6 +2085,9 @@ class AdSkipAccessibilityService : AccessibilityService() {
         splashEmptyRoots = 0
         splashBlankTree = 0
         splashReject = ""
+        splashMatchInfo = ""
+        splashFirstClickMs = -1L
+        splashFirstClickInfo = ""
         Stats.splashLastPkg = pkg
         handler.removeCallbacks(splashTicker)
         handler.post(splashTicker)
@@ -2031,7 +2163,13 @@ class AdSkipAccessibilityService : AccessibilityService() {
             }
             if (clickNode(node)) {
                 splashNodeClicks++
-                if (splashNodeClicks == 1) Log.i(TAG, "开屏首击时延 +${sinceStart}ms")
+                if (splashNodeClicks == 1) {
+                    splashFirstClickMs = sinceStart
+                    splashFirstClickInfo = splashMatchInfo.ifEmpty {
+                        node.viewIdResourceName ?: node.className?.toString().orEmpty()
+                    }
+                    Log.i(TAG, "开屏首击时延 +${sinceStart}ms")
+                }
                 lastSplashClickKey = key
                 lastSplashClick = SystemClock.elapsedRealtime()
                 splashClosedPending = true

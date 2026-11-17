@@ -15,6 +15,8 @@ import java.util.concurrent.Executors
  */
 object AdLog {
     private const val FILE_NAME = "ads.log"
+    // 只查主包版本：AndroidManifest 的 <queries> 里声明的就是它
+    private const val HONGGUO_PKG = "com.phoenix.read"
     private const val MAX_LINES = 400
     private const val KEEP_LINES = 200
 
@@ -28,16 +30,40 @@ object AdLog {
     fun init(context: Context) {
         val dir = context.getExternalFilesDir(null) ?: context.filesDir
         file = File(dir, FILE_NAME)
-        val version = runCatching {
-            context.packageManager.getPackageInfo(context.packageName, 0).versionName
-        }.getOrNull() ?: "?"
-        append("== 跳跳狐 v$version / ${Build.MODEL} 台账开始 ==")
+        val info = runCatching {
+            context.packageManager.getPackageInfo(context.packageName, 0)
+        }.getOrNull()
+        val version = info?.versionName ?: "?"
+        val dm = context.resources.displayMetrics
+        // 红果自己的版本号：广告形态跟着它改版变，日后一条判据失灵，先看是不是版本对不上
+        val hg = runCatching {
+            context.packageManager.getPackageInfo(HONGGUO_PKG, 0).versionName
+        }.getOrNull() ?: "未装"
+        @Suppress("DEPRECATION")
+        append("== ${stamp()} 跳跳狐 v$version(vc${info?.versionCode ?: 0}) / ${Build.MODEL}" +
+            " ${dm.widthPixels}x${dm.heightPixels} 档位${Settings.speedTier} 红果 $hg 台账开始 ==")
     }
 
     fun start(detail: String) {
         val stale = openLine
         if (stale != null) append("$stale → 没等到复核结论（被下一条命中顶掉）")
         openLine = "${stamp()} $detail"
+    }
+
+    /** 中途补一段（出手时刻、复核时刻），最后随 end 一起落盘。 */
+    fun mark(extra: String) {
+        val line = openLine ?: return
+        openLine = "$line $extra"
+    }
+
+    /**
+     * 一条广告之外的取证行。两类：
+     * · 候选未出手 —— 看着像广告但被某道闸挡掉了，只记不动手。这是没人现场挂 adb 时发现
+     *   「擦边却没跳」的那条通道（完全不在判据射程里的，靠静默样本那行）。
+     * · 环境事实（界面名、正片基线、取不到树、静默样本）—— 解释「这台机器为什么一条广告都没记到」。
+     */
+    fun note(detail: String) {
+        append("${stamp()} $detail")
     }
 
     /**
