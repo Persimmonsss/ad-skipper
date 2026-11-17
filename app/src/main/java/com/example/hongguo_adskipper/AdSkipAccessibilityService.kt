@@ -473,6 +473,9 @@ class AdSkipAccessibilityService : AccessibilityService() {
         handler.removeCallbacks(biliTicker)
         handler.postDelayed(periodicCheck, if (foregroundPkg in TARGET_PACKAGES) checkIntervalActive() else checkIntervalIdle())
         if (foregroundPkg == BiliUiSkip.BILI_PKG) ensureBiliTicker()
+        // 首行的「台账开始」只代表进程起来了（打开界面、前台服务重启都会写一行），不代表无障碍真的绑上。
+        // 掉权限是「台账整段安静」最常见的真凶，这两行一上一下才能把「没广告」和「没在岗」分开。
+        AdLog.note("跳跳狐 服务上线（无障碍已绑）")
         logDebug("服务已启动 $notificationTitle")
     }
 
@@ -2432,6 +2435,8 @@ class AdSkipAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         super.onDestroy()
+        // 放在最前面：后面那些收尾动作再快，也不该挡掉这行「从现在起我不在岗」
+        AdLog.note("跳跳狐 服务下线（无障碍解绑，从现在起不跳广告）")
         isServiceEnabled = false
         if (instance === this) instance = null
         // 一条清干净：逐个 removeCallbacks 早晚会漏掉新加的 runnable。
