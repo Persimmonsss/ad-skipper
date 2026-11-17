@@ -1181,7 +1181,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
                 }
                 // 候选未出手：可见节点确实掉到基线 70% 以下、却被某道闸挡住的画面。只记不动手 ——
                 // 这是没人挂 adb 现场盯、也能发现「新形态漏跳」的通道之一。
-                // 连挂 1.5 秒以上才落一行（切集动画与加载中的瞬时掉节点不值得记），同一种挡法 30 秒内只记一次。
+                // 连挂 1.5 秒以上才落一行（切集动画与加载中的瞬时掉节点不值得记），之后每 30 秒最多一行。
                 val blocked = if (layerAd) null else layerBlockedReason(sig, beat)
                 if (blocked == null) {
                     layerCandSince = 0L
