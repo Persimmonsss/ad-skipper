@@ -1075,7 +1075,9 @@ class AdSkipAccessibilityService : AccessibilityService() {
                             byLive -> "直播广告"
                             else -> "结构:广告层"
                         },
-                        currentTime
+                        currentTime,
+                        sig,
+                        held
                     )
                     return
                 }
@@ -1112,8 +1114,9 @@ class AdSkipAccessibilityService : AccessibilityService() {
                     // 否则长广告过了 30 秒窗口就自己失效了
                     lastPlayerFrameAt = beat
                     if (beat - layerAdSince >= layerHoldMs) {
+                        val held = beat - layerAdSince
                         layerAdSince = 0L
-                        onAdDetected("广告层差分", currentTime)
+                        onAdDetected("广告层差分", currentTime, sig, held)
                         return
                     }
                 } else if (layerAdSince != 0L) {
@@ -1124,7 +1127,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
         val detected = detectAdFor(pkg, sig?.texts ?: lastScreenTexts)
         if (detected) {
             lastAdFrameAt = beat
-            onAdDetected(lastAdKeyword, currentTime)
+            onAdDetected(lastAdKeyword, currentTime, sig, 0)
         } else {
             // 当前不是广告，检查上一次滑动是否成功
             if (wasAdBeforeSwipe && (currentTime - lastSwipeTime) > SWIPE_DELAY_MS) {
@@ -1138,7 +1141,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
     }
 
     /** 命中广告后的统一动作：计数、记日志、延迟上滑、再复核。 */
-    private fun onAdDetected(keyword: String, currentTime: Long) {
+    private fun onAdDetected(keyword: String, currentTime: Long, sig: ZoneSig?, heldMs: Long) {
         // 滑动节流 + 连续预算统一在这里拦截（事件驱动下入口不再前置，防止同一广告反复滑动）
         if (!canSwipeNow(currentTime)) {
             logDebug("广告命中但滑动被节流拦截")
@@ -1153,6 +1156,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
         wasAdBeforeSwipe = true
 
         logDebug("广告命中:[$keyword] 剧:$dramaTitle 集:$currentEpisode")
+        AdLog.start(adFeatureLine(keyword, sig, heldMs))
 
         lastSwipeTime = currentTime
         Counters.inc(SkipStat.HG_SKIP)
@@ -1165,6 +1169,26 @@ class AdSkipAccessibilityService : AccessibilityService() {
     }
 
     /**
+     * 台账一行的前半段：命中时刻那条广告在树上的全部特征。
+     * 分区/可见数/基线用来判形态，文案与 id 用来事后认出新形态，机型无关所以两台手机的行能直接对比。
+     */
+    private fun adFeatureLine(keyword: String, sig: ZoneSig?, heldMs: Long): String {
+        if (sig == null) return "红果 判据=$keyword 无结构签名（退回文案判定）"
+        val flags = buildString {
+            if (sig.hintText) append(" 提示条")
+            if (sig.hintCountdown > 0) append(" 倒计时${sig.hintCountdown}s")
+            if (sig.liveRender) append(" 直播面")
+            if (sig.adTag) append(" 角标")
+            if (sig.playerUi) append(" 播放器控件")
+        }
+        return "红果 判据=$keyword ${if (sig.landscape) "横屏" else "竖屏"}" +
+            " 分区${sig.ul}/${sig.ur}/${sig.bb} 可见${sig.vis}" +
+            (if (playerVisBase > 0f) "/基线${playerVisBase.toInt()}" else "") + flags +
+            (if (heldMs > 0) " 挂${heldMs}ms" else "") +
+            " 文案[${sig.texts.take(3).joinToString(" ")}] id[${sig.ids.take(3).joinToString(" ")}]"
+    }
+
+    /**
      * 排队到点的手势：先核对「没过期 + 广告还在屏上」再划。
      * 主线程被事件洪压住或进程被系统冻结时，延时会从 0.3 秒涨到几十秒，
      * 这时界面上早就不是刚才那条广告了，宁可漏跳也不能在正片上乱划。
@@ -1174,8 +1198,10 @@ class AdSkipAccessibilityService : AccessibilityService() {
         val queued = now - swipeQueuedAt
         if (queued > STALE_SWIPE_MS) {
             logDebug("手势排队${queued}ms 已过期，丢弃")
+            AdLog.end("手势丢弃：排队${queued}ms 过期，没划")
         } else if (now - lastAdFrameAt > STALE_SWIPE_MS) {
             logDebug("出手前复核：广告已不在界面（${now - lastAdFrameAt}ms 前），丢弃")
+            AdLog.end("广告已自己收场，没划")
         } else if (performSwipeUp()) {
             logDebug("已执行滑动 第${consecutiveSwipes}次")
             showUndoBubble(consecutiveSwipes.toLong())
@@ -1185,6 +1211,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
             }, 2000)
         } else {
             logDebug("滑动未执行：红果已不在前台")
+            AdLog.end("手势未执行：红果已不在前台")
         }
     }
 
@@ -1546,13 +1573,26 @@ class AdSkipAccessibilityService : AccessibilityService() {
      */
     private fun checkSwipeResult(attempt: Int = 0) {
         // 滑动 + 复核一共延了 3.2 秒，用户可能已经按了电源；息屏时截图既没意义也费电
-        if (!screenOn()) { logDebug("复核跳过：已息屏"); return }
+        if (!screenOn()) {
+            logDebug("复核跳过：已息屏")
+            AdLog.end("复核跳过：已息屏")
+            return
+        }
         val rootNode = activeWindowRoot()
-        if (rootNode == null) { logDebug("复核跳过：取不到活动窗口"); return }
+        if (rootNode == null) {
+            logDebug("复核跳过：取不到活动窗口")
+            AdLog.end("复核跳过：取不到活动窗口")
+            return
+        }
         val packageName = rootNode.packageName?.toString()
-        if (packageName == null) { logDebug("复核跳过：窗口无包名"); return }
+        if (packageName == null) {
+            logDebug("复核跳过：窗口无包名")
+            AdLog.end("复核跳过：窗口无包名")
+            return
+        }
         if (!TARGET_PACKAGES.contains(packageName)) {
             logDebug("复核跳过：前台是 $packageName")
+            AdLog.end("复核跳过：前台变成 $packageName")
             return
         }
 
@@ -1569,6 +1609,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
                     handler.postDelayed({ checkSwipeResult(attempt + 1) }, 500)
                 } else {
                     logDebug("复核取样连续失败，交给轮询")
+                    AdLog.end("复核取样连续失败，交给轮询")
                 }
                 return@sampleScreenMatch
             }
@@ -1607,6 +1648,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
                 retryingAd = false
                 lockRetries = 0
                 logDebug("倒计时重试 ${LOCK_RETRY_MAX} 次仍失败，放弃，交给轮询")
+                AdLog.end("划了${LOCK_RETRY_MAX}次仍没离开广告，交给轮询")
             }
         } else if (!successCounted) {
             // 同一轮里「命中后的复核」和「重试的复核」会同时到达（实测 11ms 内两条），
@@ -1617,6 +1659,7 @@ class AdSkipAccessibilityService : AccessibilityService() {
             retryingAd = false
             lockRetries = 0
             logDebug("滑动成功，已离开广告（$reason）")
+            AdLog.end("已离开广告（$reason）")
         }
         sendStatsBroadcast()
     }
@@ -1851,6 +1894,11 @@ class AdSkipAccessibilityService : AccessibilityService() {
             "开屏收场 ${pkg.substringAfterLast('.')} $outcome（$why）" +
                 " 扫${splashScans}拍 无根${splashEmptyRoots} 无文案${splashBlankTree}" +
                 if (splashReject.isNotEmpty()) " 挡掉「$splashReject」" else ""
+        )
+        AdLog.splash(
+            "开屏 $pkg $outcome（$why） 扫${splashScans}拍 无根${splashEmptyRoots} 无文案${splashBlankTree}" +
+                (if (splashMatchInfo.isNotEmpty()) " 认到「$splashMatchInfo」" else "") +
+                (if (splashReject.isNotEmpty()) " 挡掉「$splashReject」" else "")
         )
     }
 

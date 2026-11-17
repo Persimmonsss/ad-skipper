@@ -9,6 +9,7 @@ class App : Application() {
         Counters.init(this)
         Today.init(this)
         DiagLog.init(this)
+        AdLog.init(this)
         DiagLog.log("App 启动 v${runCatching { packageManager.getPackageInfo(packageName, 0).versionName }.getOrNull()}")
     }
 }
